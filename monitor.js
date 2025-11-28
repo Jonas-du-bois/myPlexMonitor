@@ -177,8 +177,11 @@ if (CONFIG.isProduction && CONFIG.webhookUrl) {
         res.sendStatus(200);
     });
     
-    // Set webhook
-    bot.setWebHook(`${CONFIG.webhookUrl}${webhookPath}`).then(() => {
+    // Delete any existing webhook first, then set the new one
+    bot.deleteWebHook().then(() => {
+        console.log("🔄 Cleared existing webhook");
+        return bot.setWebHook(`${CONFIG.webhookUrl}${webhookPath}`);
+    }).then(() => {
         console.log(`✅ Webhook configured: ${CONFIG.webhookUrl}${webhookPath}`);
     }).catch((err) => {
         console.error("❌ Failed to set webhook:", err.message);
