@@ -1136,42 +1136,63 @@ bot.onText(/\/delete(?:\s+(.+))?/, async (msg, match) => {
 /**
  * /server - Show server system information
  */
-bot.onText(/\/server/, (msg) => {
+bot.onText(/\/server/, async (msg) => {
     const chatId = msg.chat.id;
     
     if (!isAuthorized(msg.from.id)) {
         return sendUnauthorizedMessage(chatId);
     }
     
-    // Get local system info (where bot is running)
-    const uptime = os.uptime();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
-    const memPercent = Math.round((usedMem / totalMem) * 100);
-    const cpuCores = os.cpus().length;
-    const loadAvg = os.loadavg()[0].toFixed(2);
+    bot.sendMessage(chatId, "🔄 Fetching server information...");
     
-    const message = `
+    // Get qBittorrent disk info (this is from the actual media server!)
+    let diskInfo = null;
+    try {
+        const mainData = await qbRequest("/sync/maindata");
+        if (mainData && mainData.server_state) {
+            diskInfo = {
+                freeSpace: mainData.server_state.free_space_on_disk,
+                dlSpeed: mainData.server_state.dl_info_speed,
+                upSpeed: mainData.server_state.up_info_speed,
+                totalDownloaded: mainData.server_state.alltime_dl,
+                totalUploaded: mainData.server_state.alltime_ul,
+            };
+        }
+    } catch (err) {
+        console.log("Could not get qBittorrent disk info:", err.message);
+    }
+    
+    // Build the message
+    let message = `
 🖥️ *Server Information*
 
 📡 *Plex Server:* \`${CONFIG.serverIp}:${CONFIG.plexPort}\`
-🟢 Status: ${state.isServerOnline ? "Online" : "Offline"}
+${state.isServerOnline ? "🟢" : "🔴"} Status: ${state.isServerOnline ? "Online" : "Offline"}
 
 📥 *qBittorrent:* \`${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}\`
-${state.qbConnected ? "🟢" : "🔴"} Status: ${state.qbConnected ? "Connected" : "Disconnected"}
+${state.qbConnected ? "🟢" : "🔴"} Status: ${state.qbConnected ? "Connected" : "Disconnected"}`;
 
-💾 *Memory Usage*
-├ Used: ${formatBytes(usedMem)} / ${formatBytes(totalMem)}
-├ Free: ${formatBytes(freeMem)}
-└ Usage: ${createProgressBar(memPercent)} ${memPercent}%
+    // Add disk info if available (from the actual media server!)
+    if (diskInfo) {
+        message += `
 
-⚙️ *CPU*
-├ Cores: ${cpuCores}
-└ Load: ${loadAvg}
+💾 *Media Server Disk* (from qBittorrent)
+├ Free Space: ${formatBytes(diskInfo.freeSpace)}
+├ ⬇️ Current: ${formatBytes(diskInfo.dlSpeed)}/s
+└ ⬆️ Current: ${formatBytes(diskInfo.upSpeed)}/s
+
+📊 *All-time Stats*
+├ Downloaded: ${formatBytes(diskInfo.totalDownloaded)}
+└ Uploaded: ${formatBytes(diskInfo.totalUploaded)}`;
+    }
+
+    message += `
+
+📂 *Download Paths*
+├ Movies: \`${CONFIG.paths.movies}\`
+└ Series: \`${CONFIG.paths.series}\`
 
 ⏱️ *Bot Uptime:* ${formatDuration(Math.floor((Date.now() - state.stats.botStartTime.getTime()) / 1000))}
-🖥️ *System Uptime:* ${formatDuration(uptime)}
     `;
     
     bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
