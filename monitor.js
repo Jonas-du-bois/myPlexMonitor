@@ -172,11 +172,23 @@ app.get("/health", (req, res) => {
 // Webhook endpoint for Telegram (production mode)
 let webhookPath = null;
 if (CONFIG.isProduction && CONFIG.webhookUrl) {
+    // Clean the webhook URL (remove trailing slash if present)
+    const cleanWebhookUrl = CONFIG.webhookUrl.replace(/\/+$/, "");
     webhookPath = `/bot${CONFIG.telegramToken}`;
+    
     app.post(webhookPath, (req, res) => {
-        console.log("📨 Received webhook update");
-        bot.processUpdate(req.body);
+        console.log("📨 Received webhook update from Telegram");
+        try {
+            bot.processUpdate(req.body);
+        } catch (err) {
+            console.error("❌ Error processing update:", err.message);
+        }
         res.sendStatus(200);
+    });
+    
+    // Also add a GET handler to confirm the endpoint exists
+    app.get(webhookPath, (req, res) => {
+        res.send("Telegram webhook endpoint is active. Use POST for updates.");
     });
 }
 
@@ -186,18 +198,26 @@ app.listen(CONFIG.webPort, async () => {
     if (CONFIG.isProduction && CONFIG.webhookUrl) {
         console.log(`📡 Using Telegram webhooks (production mode)`);
         
+        // Clean the webhook URL (remove trailing slash if present)
+        const cleanWebhookUrl = CONFIG.webhookUrl.replace(/\/+$/, "");
+        
         // Set webhook AFTER server is ready
         try {
             await bot.deleteWebHook({ drop_pending_updates: true });
             console.log("🔄 Cleared existing webhook and pending updates");
             
-            const webhookUrl = `${CONFIG.webhookUrl}${webhookPath}`;
-            await bot.setWebHook(webhookUrl);
-            console.log(`✅ Webhook configured: ${webhookUrl}`);
+            const fullWebhookUrl = `${cleanWebhookUrl}${webhookPath}`;
+            console.log(`🔗 Setting webhook to: ${fullWebhookUrl}`);
+            
+            await bot.setWebHook(fullWebhookUrl);
+            console.log(`✅ Webhook configured successfully`);
             
             // Verify webhook is set
             const webhookInfo = await bot.getWebHookInfo();
-            console.log(`📋 Webhook info: URL=${webhookInfo.url}, pending=${webhookInfo.pending_update_count}`);
+            console.log(`📋 Webhook info:`);
+            console.log(`   URL: ${webhookInfo.url}`);
+            console.log(`   Pending updates: ${webhookInfo.pending_update_count}`);
+            console.log(`   Last error: ${webhookInfo.last_error_message || "None"}`);
         } catch (err) {
             console.error("❌ Failed to set webhook:", err.message);
             console.log("⚠️ Falling back to polling mode...");
