@@ -1,19 +1,20 @@
+require('dotenv').config();
 const net = require('net');
 const axios = require('axios');
 
 // --- CONFIGURATION ---
 const CONFIG = {
     serverIp: process.env.IP_SERVER,
-    serverPort: 32400,                  // Port par défaut de Plex
-    checkInterval: 30000,               // 30 secondes en millisecondes
+    serverPort: 32400,                  // Default Plex port
+    checkInterval: 30000,               // 30 seconds in milliseconds
     telegramToken: process.env.TOKEN_TELEGRAM,
     telegramChatId: process.env.ID_CHAT
 };
 
-// Variable pour mémoriser l'état précédent (pour ne pas spammer)
-let isServerOnline = true; // On part du principe qu'il est en ligne au démarrage
+// Variable to store the previous server state (to avoid spamming)
+let isServerOnline = true; // Assume the server is online at startup
 
-// Fonction pour envoyer le message Telegram
+// Function to send a Telegram message
 async function sendAlert(message) {
     const url = `https://api.telegram.org/bot${CONFIG.telegramToken}/sendMessage`;
     try {
@@ -27,46 +28,46 @@ async function sendAlert(message) {
     }
 }
 
-// Fonction qui teste la connexion
+// Function to check the server connection
 function checkServer() {
     const socket = new net.Socket();
     
-    // Timeout de 5 secondes : si pas de réponse, on considère que c'est down
+    // 5-second timeout: if no response, consider it down
     socket.setTimeout(5000);
 
     socket.on('connect', () => {
         if (!isServerOnline) {
-            // Le serveur était DOWN, il est maintenant UP
-            sendAlert(`✅ Le serveur Plex est de retour en ligne !`);
+            // The server was DOWN, it is now UP
+            sendAlert(`✅ The Plex server is back online!`);
             isServerOnline = true;
         }
-        socket.destroy(); // On ferme la connexion, tout va bien
+        socket.destroy(); // Close the connection, everything is fine
     });
 
     socket.on('timeout', () => {
-        handleDown('Timeout (Pas de réponse)');
+        handleDown('Timeout (No response)');
         socket.destroy();
     });
 
     socket.on('error', (err) => {
-        handleDown(`Erreur (${err.code})`);
+        handleDown(`Error (${err.code})`);
     });
 
     socket.connect(CONFIG.serverPort, CONFIG.serverIp);
 }
 
-// Gestion de la panne
+// Function to handle the server down state
 function handleDown(reason) {
     if (isServerOnline) {
-        // Le serveur était UP, il vient de passer DOWN
-        sendAlert(`🚨 ALERTE: Le serveur Plex est HORS LIGNE !\nRaison: ${reason}`);
+        // The server was UP, it just went DOWN
+        sendAlert(`🚨 ALERT: The Plex server is OFFLINE!\nReason: ${reason}`);
         isServerOnline = false;
     }
 }
 
-// Démarrage du script
-console.log(`Monitoring de ${CONFIG.serverIp}:${CONFIG.serverPort} démarré...`);
-// Premier check immédiat
+// Script startup
+console.log(`Monitoring of ${CONFIG.serverIp}:${CONFIG.serverPort} started...`);
+// Immediate first check
 checkServer();
-// Puis boucle infinie
+// Then infinite loop
 setInterval(checkServer, CONFIG.checkInterval);

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "bot télégram qui vérifie l'état de mon server plex",
   "keywords": [],
-  "license": "ISC",
+  "license": "MIT",
   "author": "jonas_du_bois",
   "type": "commonjs",
   "main": "monitor.js",
@@ -11,6 +11,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "axios": "^1.13.2"
+    "axios": "^1.13.2",
+    "dotenv": "^16.4.5"
   }
 }
