@@ -170,28 +170,39 @@ app.get("/health", (req, res) => {
 });
 
 // Webhook endpoint for Telegram (production mode)
+let webhookPath = null;
 if (CONFIG.isProduction && CONFIG.webhookUrl) {
-    const webhookPath = `/bot${CONFIG.telegramToken}`;
+    webhookPath = `/bot${CONFIG.telegramToken}`;
     app.post(webhookPath, (req, res) => {
+        console.log("📨 Received webhook update");
         bot.processUpdate(req.body);
         res.sendStatus(200);
     });
-    
-    // Delete any existing webhook first, then set the new one
-    bot.deleteWebHook().then(() => {
-        console.log("🔄 Cleared existing webhook");
-        return bot.setWebHook(`${CONFIG.webhookUrl}${webhookPath}`);
-    }).then(() => {
-        console.log(`✅ Webhook configured: ${CONFIG.webhookUrl}${webhookPath}`);
-    }).catch((err) => {
-        console.error("❌ Failed to set webhook:", err.message);
-    });
 }
 
-app.listen(CONFIG.webPort, () => {
+app.listen(CONFIG.webPort, async () => {
     console.log(`🌐 Web server started on port ${CONFIG.webPort}`);
+    
     if (CONFIG.isProduction && CONFIG.webhookUrl) {
         console.log(`📡 Using Telegram webhooks (production mode)`);
+        
+        // Set webhook AFTER server is ready
+        try {
+            await bot.deleteWebHook({ drop_pending_updates: true });
+            console.log("🔄 Cleared existing webhook and pending updates");
+            
+            const webhookUrl = `${CONFIG.webhookUrl}${webhookPath}`;
+            await bot.setWebHook(webhookUrl);
+            console.log(`✅ Webhook configured: ${webhookUrl}`);
+            
+            // Verify webhook is set
+            const webhookInfo = await bot.getWebHookInfo();
+            console.log(`📋 Webhook info: URL=${webhookInfo.url}, pending=${webhookInfo.pending_update_count}`);
+        } catch (err) {
+            console.error("❌ Failed to set webhook:", err.message);
+            console.log("⚠️ Falling back to polling mode...");
+            bot.startPolling();
+        }
     } else {
         console.log(`📡 Using Telegram polling (development mode)`);
     }
