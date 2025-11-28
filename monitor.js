@@ -42,6 +42,7 @@ const CONFIG = {
     // --- Telegram Bot Configuration ---
     telegramToken: process.env.TELEGRAM_TOKEN || process.env.TOKEN_TELEGRAM,
     telegramChatId: process.env.TELEGRAM_CHAT_ID || process.env.ID_CHAT,
+    webhookUrl: process.env.WEBHOOK_URL, // For production (Render)
     
     // --- Monitoring Configuration ---
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 30000, // 30 seconds
@@ -50,7 +51,7 @@ const CONFIG = {
     // --- qBittorrent Configuration ---
     // Uses the same SERVER_IP by default (same machine as Plex)
     qbittorrent: {
-        host: process.env.QBITTORRENT_HOST || process.env.SERVER_IP || process.env.PLEX_IP || "localhost",
+        host: process.env.QBITTORRENT_HOST || process.env.SERVER_IP || process.env.PLEX_IP || process.env.IP_SERVER || "localhost",
         port: parseInt(process.env.QBITTORRENT_PORT) || 8080,
         username: process.env.QBITTORRENT_USERNAME || "admin",
         password: process.env.QBITTORRENT_PASSWORD || "adminadmin",
@@ -71,6 +72,9 @@ const CONFIG = {
     
     // --- Web Server Configuration (for Render/hosting) ---
     webPort: process.env.PORT || 3000,
+    
+    // --- Environment Detection ---
+    isProduction: process.env.NODE_ENV === "production" || !!process.env.PORT,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -78,10 +82,13 @@ const CONFIG = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Initialize the Telegram bot with polling enabled
- * Polling allows the bot to continuously check for new messages
+ * Initialize the Telegram bot
+ * - Uses webhooks in production (Render) to avoid 409 conflicts
+ * - Uses polling in development for easier testing
  */
-const bot = new TelegramBot(CONFIG.telegramToken, { polling: true });
+const bot = CONFIG.isProduction && CONFIG.webhookUrl
+    ? new TelegramBot(CONFIG.telegramToken, { webHook: true })
+    : new TelegramBot(CONFIG.telegramToken, { polling: true });
 
 /**
  * Initialize the Plex API client
@@ -133,6 +140,7 @@ const state = {
  * Provides basic health check endpoints and status information
  */
 const app = express();
+app.use(express.json());
 
 // Health check endpoint - useful for monitoring services
 app.get("/", (req, res) => {
@@ -161,8 +169,29 @@ app.get("/health", (req, res) => {
     });
 });
 
+// Webhook endpoint for Telegram (production mode)
+if (CONFIG.isProduction && CONFIG.webhookUrl) {
+    const webhookPath = `/bot${CONFIG.telegramToken}`;
+    app.post(webhookPath, (req, res) => {
+        bot.processUpdate(req.body);
+        res.sendStatus(200);
+    });
+    
+    // Set webhook
+    bot.setWebHook(`${CONFIG.webhookUrl}${webhookPath}`).then(() => {
+        console.log(`✅ Webhook configured: ${CONFIG.webhookUrl}${webhookPath}`);
+    }).catch((err) => {
+        console.error("❌ Failed to set webhook:", err.message);
+    });
+}
+
 app.listen(CONFIG.webPort, () => {
     console.log(`🌐 Web server started on port ${CONFIG.webPort}`);
+    if (CONFIG.isProduction && CONFIG.webhookUrl) {
+        console.log(`📡 Using Telegram webhooks (production mode)`);
+    } else {
+        console.log(`📡 Using Telegram polling (development mode)`);
+    }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -309,12 +338,16 @@ function autoCheck() {
  */
 async function qbLogin() {
     try {
+        const url = `http://${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}/api/v2/auth/login`;
+        console.log(`🔐 Attempting qBittorrent login at ${url}`);
+        
         const response = await axios.post(
-            `http://${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}/api/v2/auth/login`,
+            url,
             `username=${encodeURIComponent(CONFIG.qbittorrent.username)}&password=${encodeURIComponent(CONFIG.qbittorrent.password)}`,
             {
                 headers: { "Content-Type": "application/x-www-form-urlencoded" },
                 withCredentials: true,
+                timeout: 5000,
             }
         );
         
@@ -325,6 +358,7 @@ async function qbLogin() {
             if (sidCookie) {
                 state.qbCookie = sidCookie.split(";")[0];
                 state.qbConnected = true;
+                console.log("✅ qBittorrent authentication successful");
                 return true;
             }
         }
@@ -332,12 +366,20 @@ async function qbLogin() {
         // Some versions return "Ok." in the body
         if (response.data === "Ok.") {
             state.qbConnected = true;
+            console.log("✅ qBittorrent authentication successful");
             return true;
         }
         
+        console.log("⚠️  qBittorrent authentication failed - unexpected response");
         return false;
     } catch (error) {
-        console.error("qBittorrent login error:", error.message);
+        if (error.code === 'ECONNREFUSED') {
+            console.error(`❌ qBittorrent connection refused at ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}`);
+        } else if (error.code === 'ETIMEDOUT') {
+            console.error(`❌ qBittorrent connection timeout at ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}`);
+        } else {
+            console.error(`❌ qBittorrent login error: ${error.message}`);
+        }
         state.qbConnected = false;
         return false;
     }
@@ -418,6 +460,9 @@ async function getTorrents() {
     try {
         return await qbRequest("/torrents/info");
     } catch (error) {
+        if (error.message.includes("authenticate")) {
+            throw new Error("Failed to authenticate with qBittorrent");
+        }
         console.error("Error getting torrents:", error.message);
         return [];
     }
@@ -1301,7 +1346,12 @@ bot.on("callback_query", async (callbackQuery) => {
  * Handle polling errors gracefully
  */
 bot.on("polling_error", (error) => {
-    console.error("Telegram polling error:", error.message);
+    if (error.code === 'ETELEGRAM' && error.message.includes('409')) {
+        console.error("⚠️  Telegram 409 Conflict: Another bot instance is running!");
+        console.error("   💡 Solution: Stop all other instances or use webhooks in production");
+    } else {
+        console.error("Telegram polling error:", error.message);
+    }
 });
 
 /**
@@ -1319,6 +1369,58 @@ process.on("unhandledRejection", (reason, promise) => {
 // ║                              STARTUP                                         ║
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Validate configuration before starting
+ */
+function validateConfig() {
+    const errors = [];
+    const warnings = [];
+    
+    // Critical checks
+    if (!CONFIG.telegramToken) {
+        errors.push("❌ TELEGRAM_TOKEN is not configured!");
+    }
+    if (!CONFIG.serverIp) {
+        errors.push("❌ SERVER_IP is not configured!");
+    }
+    if (!CONFIG.plexToken) {
+        warnings.push("⚠️  PLEX_TOKEN is not configured - Plex features will be limited");
+    }
+    if (!CONFIG.telegramChatId) {
+        warnings.push("⚠️  TELEGRAM_CHAT_ID is not configured - automatic alerts disabled");
+    }
+    
+    // qBittorrent host check
+    if (CONFIG.qbittorrent.host === "localhost" && CONFIG.isProduction) {
+        warnings.push("⚠️  qBittorrent host is 'localhost' but SERVER_IP might not be configured");
+        warnings.push("   💡 Set SERVER_IP environment variable to your server's IP address");
+    }
+    
+    // Webhook check for production
+    if (CONFIG.isProduction && !CONFIG.webhookUrl) {
+        warnings.push("⚠️  WEBHOOK_URL not configured - falling back to polling (may cause 409 errors)");
+        warnings.push("   💡 Set WEBHOOK_URL to https://myplexmonitor.onrender.com for production");
+    }
+    
+    // Display results
+    if (errors.length > 0) {
+        console.log("\n🚨 CONFIGURATION ERRORS:");
+        errors.forEach(err => console.log(err));
+        console.log("\n⚠️  Bot may not work correctly!\n");
+    }
+    
+    if (warnings.length > 0) {
+        console.log("\n⚠️  CONFIGURATION WARNINGS:");
+        warnings.forEach(warn => console.log(warn));
+        console.log();
+    }
+    
+    return errors.length === 0;
+}
+
+// Validate configuration
+const configValid = validateConfig();
+
 // Start the automatic monitoring loop
 setInterval(autoCheck, CONFIG.checkInterval);
 
@@ -1334,14 +1436,24 @@ qbLogin().then((success) => {
     }
 });
 
+// Test Plex connection
+pingServer((isOnline, reason) => {
+    if (isOnline) {
+        console.log("✅ Plex server is reachable");
+    } else {
+        console.log(`⚠️  Plex server is not reachable: ${reason}`);
+    }
+});
+
 // Startup complete message
 console.log(`
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                         🎬 MyPlexMonitor Started! 🎬                         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Server IP: ${CONFIG.serverIp}                                            
+║  Mode: ${CONFIG.isProduction ? "PRODUCTION" : "DEVELOPMENT"}                                                   
+║  Server IP: ${CONFIG.serverIp || "NOT SET"}                                            
 ║  Plex Port: ${CONFIG.plexPort}                                                  
-║  qBittorrent Port: ${CONFIG.qbittorrent.port}                                             
+║  qBittorrent: ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}                                      
 ║  Check Interval: ${CONFIG.checkInterval / 1000}s                                                  
 ║  Web Port: ${CONFIG.webPort}                                                        
 ╚══════════════════════════════════════════════════════════════════════════════╝

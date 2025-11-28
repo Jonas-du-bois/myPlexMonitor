@@ -23,7 +23,8 @@
   "scripts": {
     "start": "node monitor.js",
     "dev": "node --watch monitor.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test-config.js",
+    "test-config": "node test-config.js"
   },
   "engines": {
     "node": ">=16.0.0"

@@ -1,4 +1,4 @@
-# í¾¬ MyPlexMonitor
+# ï¿½ï¿½ï¿½ MyPlexMonitor
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-2.0.0-blue.svg" alt="Version">
@@ -10,32 +10,32 @@ A powerful Telegram bot to monitor your Plex server and manage qBittorrent downl
 
 ## âœ¨ Features
 
-### í³¡ Server Monitoring
+### ï¿½ï¿½ï¿½ Server Monitoring
 - **Real-time Status Checks** - Periodically monitors your Plex server's availability
 - **Automatic Alerts** - Get notified instantly when your server goes down or comes back online
 - **Downtime Tracking** - See how long your server was offline
 
-### í¾¬ Plex Integration
+### ï¿½ï¿½ï¿½ Plex Integration
 - **Recently Added** - View the latest movies and shows added to your library
 - **Library Search** - Search your entire Plex library directly from Telegram
 - **Statistics** - Get detailed stats about your library (movies, shows, music, etc.)
 
-### í³¥ qBittorrent Integration
+### ï¿½ï¿½ï¿½ qBittorrent Integration
 - **Add Torrents** - Send magnet links directly to your qBittorrent
 - **Smart Paths** - Automatically sorts movies and series to different folders
 - **Download Progress** - Track all your active downloads with progress bars
 - **Completion Alerts** - Get notified when downloads finish
 - **Torrent Management** - Pause, resume, or delete torrents from Telegram
 
-### í´’ Security
+### ï¿½ï¿½ï¿½ Security
 - **User Authorization** - Restrict bot access to specific Telegram users
 - **Secure Credentials** - All sensitive data stored in environment variables
 
-### í¼ Hosting Ready
+### ï¿½ï¿½ï¿½ Hosting Ready
 - Built-in web server for platforms like Render
 - Health check endpoints for monitoring
 
-## í³‹ Commands
+## ï¿½ï¿½ï¿½ Commands
 
 | Command | Description |
 |---------|-------------|
@@ -54,7 +54,7 @@ A powerful Telegram bot to monitor your Plex server and manage qBittorrent downl
 | \`/delete <name>\` | Delete a torrent |
 | \`/help\` | Show all commands |
 
-## íº€ Installation
+## ï¿½ï¿½ï¿½ Installation
 
 ### Prerequisites
 
@@ -115,7 +115,7 @@ Copy \`.env.example\` to \`.env\` and fill in your values:
 | \`AUTHORIZED_USERS\` | (empty) | Comma-separated Telegram user IDs |
 | \`PORT\` | \`3000\` | Web server port |
 
-## í´§ qBittorrent Setup
+## ï¿½ï¿½ï¿½ qBittorrent Setup
 
 1. **Enable WebUI** in qBittorrent:
    - Go to \`Tools\` > \`Options\` > \`Web UI\`
@@ -130,7 +130,7 @@ Copy \`.env.example\` to \`.env\` and fill in your values:
    SERIES_PATH=/mnt/films/series
    \`\`\`
 
-## í°³ Docker (Optional)
+## ï¿½ï¿½ï¿½ Docker (Optional)
 
 \`\`\`dockerfile
 FROM node:18-alpine
@@ -146,7 +146,7 @@ docker build -t myplexmonitor .
 docker run -d --env-file .env myplexmonitor
 \`\`\`
 
-## í¼ Deploying to Render
+## ï¿½ï¿½ï¿½ Deploying to Render
 
 1. Create a new Web Service on Render
 2. Connect your GitHub repository
@@ -154,30 +154,30 @@ docker run -d --env-file .env myplexmonitor
 4. Set the start command: \`npm start\`
 5. Add your environment variables in the Render dashboard
 
-## í³¸ Screenshots
+## ï¿½ï¿½ï¿½ Screenshots
 
 ### Download Management
 \`\`\`
-í³¥ Downloads
+ï¿½ï¿½ï¿½ Downloads
 
 â¬‡ï¸ 5.2 MB/s | â¬†ï¸ 1.1 MB/s
 
 â¬‡ï¸ Movie.Name.2024.1080p.mkv
 â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–‘ 90% | â¬‡ï¸ 5.2 MB/s | â±ï¸ 2m 30s
 
-í³¤ Another.Movie.2023.mkv
+ï¿½ï¿½ï¿½ Another.Movie.2023.mkv
 â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆ 100%
 \`\`\`
 
 ### Server Status
 \`\`\`
-í¿¢ Server Status: ONLINE
+ï¿½ï¿½ï¿½ Server Status: ONLINE
 
-í³¡ Server: 192.168.1.100:32400
+ï¿½ï¿½ï¿½ Server: 192.168.1.100:32400
 â° Last check: 11/28/2025, 2:30:00 PM
 \`\`\`
 
-## í´ Contributing
+## ï¿½ï¿½ï¿½ Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
@@ -187,11 +187,11 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (\`git push origin feature/AmazingFeature\`)
 5. Open a Pull Request
 
-## í³ License
+## ï¿½ï¿½ï¿½ License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## í¹ Acknowledgments
+## ï¿½ï¿½ï¿½ Acknowledgments
 
 - [node-telegram-bot-api](https://github.com/yagop/node-telegram-bot-api) - Telegram Bot API
 - [plex-api](https://github.com/phillipj/node-plex-api) - Plex API wrapper
