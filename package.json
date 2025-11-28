@@ -1,18 +1,38 @@
 {
-  "name": "mypleymonitor",
-  "version": "1.0.0",
-  "description": "bot télégram qui vérifie l'état de mon server plex",
-  "keywords": [],
+  "name": "myplexmonitor",
+  "version": "2.0.0",
+  "description": "🎬 A powerful Telegram bot to monitor your Plex server and manage qBittorrent downloads",
+  "keywords": [
+    "plex",
+    "telegram",
+    "bot",
+    "monitor",
+    "qbittorrent",
+    "torrent",
+    "media-server",
+    "home-server"
+  ],
   "license": "MIT",
   "author": "jonas_du_bois",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jonas-du-bois/myPlexMonitor"
+  },
   "type": "commonjs",
   "main": "monitor.js",
   "scripts": {
+    "start": "node monitor.js",
+    "dev": "node --watch monitor.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "dependencies": {
+    "axios": "^1.13.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "plex-api": "^5.2.2"
   }
 }
