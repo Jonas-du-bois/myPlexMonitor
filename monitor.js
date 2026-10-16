@@ -1,1515 +1,1060 @@
-/**
- * ╔══════════════════════════════════════════════════════════════════════════════╗
- * ║                           🎬 MyPlexMonitor 🎬                                ║
- * ║                                                                              ║
- * ║  A powerful Telegram bot to monitor your Plex server and manage downloads   ║
- * ║                                                                              ║
- * ║  Features:                                                                   ║
- * ║  • Real-time Plex server monitoring with automatic alerts                   ║
- * ║  • qBittorrent integration for torrent management                           ║
- * ║  • Plex library statistics and recently added content                       ║
- * ║  • Server health monitoring (CPU, RAM, Disk)                                ║
- * ║  • Download progress tracking with notifications                            ║
- * ║  • User authorization system for security                                   ║
- * ║                                                                              ║
- * ║  Author: jonas_du_bois                                                       ║
- * ║  License: MIT                                                                ║
- * ║  Repository: https://github.com/Jonas-du-bois/myPlexMonitor                 ║
- * ╚══════════════════════════════════════════════════════════════════════════════╝
- */
-
 require("dotenv").config();
+
 const net = require("net");
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
-const PlexAPI = require("plex-api");
 const axios = require("axios");
 const os = require("os");
+const { exec } = require("child_process");
+const { promisify } = require("util");
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                              CONFIGURATION                                   ║
-// ═══════════════════════════════════════════════════════════════════════════════
+const execAsync = promisify(exec);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+function parseIntEnv(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? fallback : parsed;
+}
 
 const CONFIG = {
-    // --- Server IP Configuration ---
-    // Single IP for both Plex and qBittorrent (they run on the same server)
-    serverIp: process.env.SERVER_IP || process.env.PLEX_IP || process.env.IP_SERVER,
-    
-    // --- Plex Server Configuration ---
-    plexPort: parseInt(process.env.PLEX_PORT) || 32400,
-    plexToken: process.env.PLEX_TOKEN,
-    
-    // --- Telegram Bot Configuration ---
-    telegramToken: process.env.TELEGRAM_TOKEN || process.env.TOKEN_TELEGRAM,
-    telegramChatId: process.env.TELEGRAM_CHAT_ID || process.env.ID_CHAT,
-    webhookUrl: process.env.WEBHOOK_URL, // For production (Render)
-    
-    // --- Monitoring Configuration ---
-    checkInterval: parseInt(process.env.CHECK_INTERVAL) || 30000, // 30 seconds
-    downloadCheckInterval: parseInt(process.env.DOWNLOAD_CHECK_INTERVAL) || 60000, // 1 minute
-    
-    // --- qBittorrent Configuration ---
-    // Uses the same SERVER_IP by default (same machine as Plex)
-    qbittorrent: {
-        host: process.env.QBITTORRENT_HOST || process.env.SERVER_IP || process.env.PLEX_IP || process.env.IP_SERVER || "localhost",
-        port: parseInt(process.env.QBITTORRENT_PORT) || 8080,
+    role: (process.env.ROLE || "LOCAL").toUpperCase() === "BACKUP" ? "BACKUP" : "LOCAL",
+    plexIp: process.env.PLEX_IP || "127.0.0.1",
+    plexPort: parseIntEnv(process.env.PLEX_PORT, 32400),
+    checkInterval: parseIntEnv(process.env.CHECK_INTERVAL, 30000),
+    telegramToken: process.env.TELEGRAM_TOKEN,
+    telegramChatId: process.env.TELEGRAM_CHAT_ID,
+    port: parseIntEnv(process.env.PORT, 3000),
+    qbit: {
+        host: process.env.QBITTORRENT_HOST || "127.0.0.1",
+        port: parseIntEnv(process.env.QBITTORRENT_PORT, 8080),
         username: process.env.QBITTORRENT_USERNAME || "admin",
         password: process.env.QBITTORRENT_PASSWORD || "adminadmin",
+        categoryMovie: process.env.QBITTORRENT_CATEGORY_MOVIE || "movies",
+        categorySeries: process.env.QBITTORRENT_CATEGORY_SERIES || "series",
+        categoryOther: process.env.QBITTORRENT_CATEGORY_OTHER || "other",
+        pathMovie: process.env.MOVIES_PATH || "/mnt/films",
+        pathSeries: process.env.SERIES_PATH || "/mnt/films/series",
+        pathOther: process.env.OTHER_PATH || "/mnt/films/downloads",
     },
-    
-    // --- Download Paths Configuration ---
-    paths: {
-        movies: process.env.MOVIES_PATH || "/mnt/films",
-        series: process.env.SERIES_PATH || "/mnt/films/series",
-    },
-    
-    // --- Security Configuration ---
-    // Comma-separated list of authorized Telegram user IDs
-    // Leave empty to allow all users (not recommended for production)
-    authorizedUsers: process.env.AUTHORIZED_USERS 
-        ? process.env.AUTHORIZED_USERS.split(",").map(id => parseInt(id.trim()))
-        : [],
-    
-    // --- Web Server Configuration (for Render/hosting) ---
-    webPort: process.env.PORT || 3000,
-    
-    // --- Environment Detection ---
-    isProduction: process.env.NODE_ENV === "production" || !!process.env.PORT,
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                           BOT INITIALIZATION                                 ║
-// ═══════════════════════════════════════════════════════════════════════════════
+if (!CONFIG.telegramToken) {
+    console.error("❌ TELEGRAM_TOKEN est obligatoire.");
+    process.exit(1);
+}
 
-/**
- * Initialize the Telegram bot
- * - Uses webhooks in production (Render) to avoid 409 conflicts
- * - Uses polling in development for easier testing
- */
-const bot = CONFIG.isProduction && CONFIG.webhookUrl
-    ? new TelegramBot(CONFIG.telegramToken, { webHook: true })
-    : new TelegramBot(CONFIG.telegramToken, { polling: true });
+// ─────────────────────────────────────────────────────────────────────────────
+// État global
+// ─────────────────────────────────────────────────────────────────────────────
+const state = {
+    isServerOnline: true,
+    failureCount: 0,
+    lastDownTime: null,
+    lastDownReason: null,
+    lastCheckReason: "Aucune vérification encore effectuée",
+    telegramPollingActive: CONFIG.role === "LOCAL",
+    torrentSessions: new Map(),
+    awaitingCustomPath: new Set(),
+    downloadsView: new Map(),
+    qbitSid: null,
+};
 
-/**
- * Initialize the Plex API client
- * Used to query library information and recently added content
- */
-const plexClient = new PlexAPI({
-    hostname: CONFIG.serverIp,
-    token: CONFIG.plexToken,
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilitaires généraux
+// ─────────────────────────────────────────────────────────────────────────────
+function pad(number) {
+    return String(number).padStart(2, "0");
+}
+
+function getFormattedDate() {
+    const parts = new Intl.DateTimeFormat("fr-CH", {
+        timeZone: "Europe/Zurich",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    }).formatToParts(new Date());
+
+    const map = Object.fromEntries(parts.filter((p) => p.type !== "literal").map((p) => [p.type, p.value]));
+    return `[${map.year}-${map.month}-${map.day}] ${map.hour}:${map.minute}:${map.second} CEST`;
+}
+
+function logInfo(message) {
+    console.log(`${getFormattedDate()} ${message}`);
+}
+
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+    return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatDuration(seconds) {
+    const total = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+function getTorrentStatusLabel(qbitState) {
+    if (["pausedDL", "pausedUP"].includes(qbitState)) return "⏸️ Pause";
+    if (["uploading", "forcedUP", "stalledUP"].includes(qbitState)) return "⬆️ Seed";
+    if (["queuedDL", "metaDL", "checkingDL", "checkingResumeData"].includes(qbitState)) return "🕓 Attente";
+    if (["error", "missingFiles"].includes(qbitState)) return "❌ Erreur";
+    if (["stalledDL"].includes(qbitState)) return "⚠️ Bloqué";
+    return "⬇️ Téléchargement";
+}
+
+function createProgressBar(percent, length = 10) {
+    const safePercent = Math.max(0, Math.min(100, percent));
+    const filled = Math.round((safePercent / 100) * length);
+    return `${"█".repeat(filled)}${"░".repeat(length - filled)}`;
+}
+
+async function safeSendMessage(chatId, text, options = {}) {
+    try {
+        await bot.sendMessage(chatId, text, options);
+    } catch (error) {
+        logInfo(`⚠️ Envoi Telegram échoué: ${error.message}`);
+    }
+}
+
+async function sendAlert(text, options = {}) {
+    if (!CONFIG.telegramChatId) {
+        logInfo("⚠️ TELEGRAM_CHAT_ID absent: alerte ignorée.");
+        return;
+    }
+    await safeSendMessage(CONFIG.telegramChatId, text, options);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram bot + failover anti-409
+// ─────────────────────────────────────────────────────────────────────────────
+const bot = new TelegramBot(CONFIG.telegramToken, { polling: CONFIG.role === "LOCAL" });
+
+bot.on("polling_error", (error) => {
+    logInfo(`⚠️ polling_error: ${error.message}`);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                              STATE MANAGEMENT                                ║
-// ═══════════════════════════════════════════════════════════════════════════════
+function isPollingActive() {
+    try {
+        if (typeof bot.isPolling === "function") {
+            return bot.isPolling();
+        }
+    } catch (error) {
+        // no-op
+    }
+    return state.telegramPollingActive;
+}
 
-/**
- * Global state object to track various states across the application
- * This helps maintain consistency and enables features like notifications
- */
-const state = {
-    // Server status tracking
-    isServerOnline: true,
-    lastCheck: null,
-    
-    // qBittorrent session tracking
-    qbCookie: null,
-    qbConnected: false,
-    
-    // User state for multi-step commands (like torrent type selection)
-    userStates: new Map(),
-    
-    // Download tracking for completion notifications
-    activeDownloads: new Map(),
-    
-    // Statistics
-    stats: {
-        checksPerformed: 0,
-        alertsSent: 0,
-        torrentsAdded: 0,
-        botStartTime: new Date(),
-    },
-};
+async function startPollingSafely() {
+    if (isPollingActive()) return;
+    try {
+        await bot.startPolling();
+        state.telegramPollingActive = true;
+        logInfo("✅ Polling Telegram activé.");
+    } catch (error) {
+        logInfo(`❌ Impossible d'activer le polling: ${error.message}`);
+    }
+}
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                         WEB SERVER (Keep-Alive)                              ║
-// ═══════════════════════════════════════════════════════════════════════════════
+async function stopPollingSafely() {
+    if (!isPollingActive()) return;
+    try {
+        await bot.stopPolling();
+        state.telegramPollingActive = false;
+        logInfo("✅ Polling Telegram arrêté.");
+    } catch (error) {
+        logInfo(`❌ Impossible d'arrêter le polling: ${error.message}`);
+    }
+}
 
-/**
- * Express web server to keep the bot alive on hosting platforms like Render
- * Provides basic health check endpoints and status information
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Express (healthcheck/keep-alive)
+// ─────────────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-// Health check endpoint - useful for monitoring services
 app.get("/", (req, res) => {
-    const uptime = Math.floor((Date.now() - state.stats.botStartTime.getTime()) / 1000);
     res.json({
         status: "running",
-        service: "MyPlexMonitor",
-        version: "2.0.0",
-        uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`,
-        plex: {
-            online: state.isServerOnline,
-            lastCheck: state.lastCheck,
-        },
-        qbittorrent: {
-            connected: state.qbConnected,
-        },
-        stats: state.stats,
+        role: CONFIG.role,
+        isServerOnline: state.isServerOnline,
+        failureCount: state.failureCount,
+        lastDownTime: state.lastDownTime,
+        timestamp: getFormattedDate(),
     });
 });
 
-// Detailed health endpoint for monitoring
-app.get("/health", (req, res) => {
-    res.json({
-        healthy: state.isServerOnline,
-        timestamp: new Date().toISOString(),
-    });
+app.listen(CONFIG.port, () => {
+    logInfo(`🌐 API HTTP prête sur le port ${CONFIG.port} (ROLE=${CONFIG.role})`);
 });
 
-// Webhook endpoint for Telegram (production mode)
-let webhookPath = null;
-if (CONFIG.isProduction && CONFIG.webhookUrl) {
-    // Clean the webhook URL (remove trailing slash if present)
-    const cleanWebhookUrl = CONFIG.webhookUrl.replace(/\/+$/, "");
-    webhookPath = `/bot${CONFIG.telegramToken}`;
-    
-    app.post(webhookPath, (req, res) => {
-        console.log("📨 Received webhook update from Telegram");
-        try {
-            bot.processUpdate(req.body);
-        } catch (err) {
-            console.error("❌ Error processing update:", err.message);
+// ─────────────────────────────────────────────────────────────────────────────
+// Vérification serveur Plex (TCP)
+// ─────────────────────────────────────────────────────────────────────────────
+function pingServer() {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        const targetHost = CONFIG.role === "LOCAL" ? "127.0.0.1" : CONFIG.plexIp;
+
+        socket.setTimeout(5000);
+
+        socket.on("connect", () => {
+            socket.destroy();
+            resolve({ online: true, reason: "Connexion TCP établie" });
+        });
+
+        socket.on("timeout", () => {
+            socket.destroy();
+            resolve({ online: false, reason: "Timeout TCP (5s)" });
+        });
+
+        socket.on("error", (err) => {
+            socket.destroy();
+            resolve({ online: false, reason: `Erreur TCP: ${err.code || err.message}` });
+        });
+
+        socket.connect(CONFIG.plexPort, targetHost);
+    });
+}
+
+async function autoCheck() {
+    try {
+        const result = await pingServer();
+        state.lastCheckReason = result.reason;
+
+        if (result.online) {
+            if (!state.isServerOnline) {
+                state.isServerOnline = true;
+                state.failureCount = 0;
+
+                if (CONFIG.role === "BACKUP") {
+                    await stopPollingSafely();
+                    await sendAlert(
+                        `✅ *RETOUR EN LIGNE*\n\nLe serveur Ubuntu répond de nouveau.\nRender repasse en veille silencieuse.\n🕒 ${getFormattedDate()}`,
+                        { parse_mode: "Markdown" }
+                    );
+                } else {
+                    await sendAlert(
+                        `✅ *Plex de nouveau opérationnel*\n\nLe service Plex répond à nouveau en local.\n🕒 ${getFormattedDate()}`,
+                        { parse_mode: "Markdown" }
+                    );
+                }
+            } else {
+                state.failureCount = 0;
+            }
+            return;
         }
-        res.sendStatus(200);
-    });
-    
-    // Also add a GET handler to confirm the endpoint exists
-    app.get(webhookPath, (req, res) => {
-        res.send("Telegram webhook endpoint is active. Use POST for updates.");
-    });
-}
 
-app.listen(CONFIG.webPort, async () => {
-    console.log(`🌐 Web server started on port ${CONFIG.webPort}`);
-    
-    if (CONFIG.isProduction && CONFIG.webhookUrl) {
-        console.log(`📡 Using Telegram webhooks (production mode)`);
-        
-        // Clean the webhook URL (remove trailing slash if present)
-        const cleanWebhookUrl = CONFIG.webhookUrl.replace(/\/+$/, "");
-        
-        // Set webhook AFTER server is ready
-        try {
-            await bot.deleteWebHook({ drop_pending_updates: true });
-            console.log("🔄 Cleared existing webhook and pending updates");
-            
-            const fullWebhookUrl = `${cleanWebhookUrl}${webhookPath}`;
-            console.log(`🔗 Setting webhook to: ${fullWebhookUrl}`);
-            
-            await bot.setWebHook(fullWebhookUrl);
-            console.log(`✅ Webhook configured successfully`);
-            
-            // Verify webhook is set
-            const webhookInfo = await bot.getWebHookInfo();
-            console.log(`📋 Webhook info:`);
-            console.log(`   URL: ${webhookInfo.url}`);
-            console.log(`   Pending updates: ${webhookInfo.pending_update_count}`);
-            console.log(`   Last error: ${webhookInfo.last_error_message || "None"}`);
-        } catch (err) {
-            console.error("❌ Failed to set webhook:", err.message);
-            console.log("⚠️ Falling back to polling mode...");
-            bot.startPolling();
+        state.failureCount += 1;
+
+        if (state.failureCount < 2) {
+            return;
         }
-    } else {
-        console.log(`📡 Using Telegram polling (development mode)`);
-    }
-});
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                          UTILITY FUNCTIONS                                   ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Check if a user is authorized to use the bot
- * @param {number} userId - Telegram user ID to check
- * @returns {boolean} - True if authorized, false otherwise
- */
-function isAuthorized(userId) {
-    // If no authorized users are configured, allow everyone (for easy setup)
-    if (CONFIG.authorizedUsers.length === 0) return true;
-    return CONFIG.authorizedUsers.includes(userId);
-}
-
-/**
- * Format bytes to human readable format
- * @param {number} bytes - Number of bytes
- * @param {number} decimals - Number of decimal places
- * @returns {string} - Formatted string (e.g., "1.5 GB")
- */
-function formatBytes(bytes, decimals = 2) {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + " " + sizes[i];
-}
-
-/**
- * Format seconds to human readable duration
- * @param {number} seconds - Duration in seconds
- * @returns {string} - Formatted duration (e.g., "2h 30m")
- */
-function formatDuration(seconds) {
-    if (seconds < 0 || !isFinite(seconds)) return "∞";
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-    
-    if (hours > 0) return `${hours}h ${minutes}m`;
-    if (minutes > 0) return `${minutes}m ${secs}s`;
-    return `${secs}s`;
-}
-
-/**
- * Create a progress bar string
- * @param {number} progress - Progress percentage (0-100)
- * @param {number} length - Length of the progress bar
- * @returns {string} - Progress bar string
- */
-function createProgressBar(progress, length = 10) {
-    const filled = Math.round((progress / 100) * length);
-    const empty = length - filled;
-    return "█".repeat(filled) + "░".repeat(empty);
-}
-
-/**
- * Send an unauthorized message to the user
- * @param {number} chatId - Telegram chat ID
- */
-function sendUnauthorizedMessage(chatId) {
-    bot.sendMessage(
-        chatId,
-        "🚫 *Unauthorized*\n\nYou are not authorized to use this bot.\nContact the administrator to get access.",
-        { parse_mode: "Markdown" }
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                        PLEX SERVER MONITORING                                ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Test if the Plex server port is accessible
- * Uses a TCP socket connection with timeout
- * @param {function} callback - Callback function(isOnline, reason)
- */
-function pingServer(callback) {
-    const socket = new net.Socket();
-    socket.setTimeout(5000); // 5 seconds timeout
-
-    socket.on("connect", () => {
-        callback(true);
-        socket.destroy();
-    });
-
-    socket.on("timeout", () => {
-        callback(false, "Timeout (No response)");
-        socket.destroy();
-    });
-
-    socket.on("error", (err) => {
-        callback(false, `Error (${err.code})`);
-    });
-
-    socket.connect(CONFIG.plexPort, CONFIG.serverIp);
-}
-
-/**
- * Automatic monitoring loop
- * Checks server status periodically and sends alerts on state changes
- */
-function autoCheck() {
-    pingServer((isOnline, reason) => {
-        state.lastCheck = new Date().toISOString();
-        state.stats.checksPerformed++;
-        
-        if (isOnline && !state.isServerOnline) {
-            // Server came back online
-            const downtime = state.lastDownTime 
-                ? formatDuration((Date.now() - state.lastDownTime) / 1000)
-                : "unknown";
-            bot.sendMessage(
-                CONFIG.telegramChatId,
-                `✅ *Plex Server is BACK ONLINE!*\n\n📡 Server: \`${CONFIG.serverIp}:${CONFIG.plexPort}\`\n⏱️ Downtime: ${downtime}`,
-                { parse_mode: "Markdown" }
-            );
-            state.isServerOnline = true;
-            state.stats.alertsSent++;
-        } else if (!isOnline && state.isServerOnline) {
-            // Server went offline
-            state.lastDownTime = Date.now();
-            bot.sendMessage(
-                CONFIG.telegramChatId,
-                `🚨 *ALERT: Plex Server is OFFLINE!*\n\n📡 Server: \`${CONFIG.serverIp}\`\n❌ Reason: ${reason}\n⏰ Time: ${new Date().toLocaleString()}`,
-                { parse_mode: "Markdown" }
-            );
+        if (state.isServerOnline) {
             state.isServerOnline = false;
-            state.stats.alertsSent++;
-        }
-    });
-}
+            state.lastDownTime = getFormattedDate();
+            state.lastDownReason = result.reason;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                        QBITTORRENT INTEGRATION                               ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Authenticate with qBittorrent WebUI
- * @returns {Promise<boolean>} - True if authentication successful
- */
-async function qbLogin() {
-    try {
-        const url = `http://${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}/api/v2/auth/login`;
-        console.log(`🔐 Attempting qBittorrent login at ${url}`);
-        
-        const response = await axios.post(
-            url,
-            `username=${encodeURIComponent(CONFIG.qbittorrent.username)}&password=${encodeURIComponent(CONFIG.qbittorrent.password)}`,
-            {
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                withCredentials: true,
-                timeout: 5000,
-            }
-        );
-        
-        // Extract the SID cookie from the response
-        const cookies = response.headers["set-cookie"];
-        if (cookies) {
-            const sidCookie = cookies.find(c => c.startsWith("SID="));
-            if (sidCookie) {
-                state.qbCookie = sidCookie.split(";")[0];
-                state.qbConnected = true;
-                console.log("✅ qBittorrent authentication successful");
-                return true;
+            if (CONFIG.role === "LOCAL") {
+                await sendAlert(
+                    `⚠️ *Plex ne répond plus en local*\n\nLe serveur Ubuntu est allumé mais le service Plex ne répond pas.\nCause: ${result.reason}\n💡 Essayez /restart_plex\n🕒 ${state.lastDownTime}`,
+                    { parse_mode: "Markdown" }
+                );
+            } else {
+                await sendAlert(
+                    `🚨 *ALERTE CRITIQUE BACKUP*\n\nLe serveur Ubuntu est injoignable depuis Internet.\nCause probable: coupure électrique, réseau ou câble.\nCause TCP: ${result.reason}\n🕒 ${state.lastDownTime}`,
+                    { parse_mode: "Markdown" }
+                );
+                await startPollingSafely();
             }
         }
-        
-        // Some versions return "Ok." in the body
-        if (response.data === "Ok.") {
-            state.qbConnected = true;
-            console.log("✅ qBittorrent authentication successful");
-            return true;
-        }
-        
-        console.log("⚠️  qBittorrent authentication failed - unexpected response");
-        return false;
     } catch (error) {
-        if (error.code === 'ECONNREFUSED') {
-            console.error(`❌ qBittorrent connection refused at ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}`);
-        } else if (error.code === 'ETIMEDOUT') {
-            console.error(`❌ qBittorrent connection timeout at ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}`);
-        } else {
-            console.error(`❌ qBittorrent login error: ${error.message}`);
-        }
-        state.qbConnected = false;
-        return false;
+        logInfo(`❌ Erreur autoCheck: ${error.message}`);
     }
 }
 
-/**
- * Make an authenticated request to qBittorrent API
- * @param {string} endpoint - API endpoint
- * @param {string} method - HTTP method
- * @param {object} data - Request data
- * @returns {Promise<object>} - API response
- */
-async function qbRequest(endpoint, method = "GET", data = null) {
-    // Ensure we're logged in
-    if (!state.qbConnected) {
-        const loggedIn = await qbLogin();
-        if (!loggedIn) throw new Error("Failed to authenticate with qBittorrent");
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostic Ubuntu (LOCAL uniquement)
+// ─────────────────────────────────────────────────────────────────────────────
+async function getUbuntuDiagnostics() {
+    if (CONFIG.role !== "LOCAL") {
+        return "Mode BACKUP: diagnostics système Ubuntu non disponibles.";
     }
-    
-    const config = {
-        method,
-        url: `http://${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}/api/v2${endpoint}`,
-        headers: {},
-    };
-    
-    if (state.qbCookie) {
-        config.headers.Cookie = state.qbCookie;
-    }
-    
-    if (data) {
-        if (method === "POST") {
-            config.headers["Content-Type"] = "application/x-www-form-urlencoded";
-            config.data = new URLSearchParams(data).toString();
-        } else {
-            config.params = data;
-        }
-    }
-    
+
+    const uptimeMin = Math.floor(os.uptime() / 60);
+    const loadAvg = os.loadavg().map((v) => v.toFixed(2)).join(" / ");
+    const freeRamMb = Math.round(os.freemem() / 1024 / 1024);
+    const totalRamMb = Math.round(os.totalmem() / 1024 / 1024);
+
+    let shutdownStatus = "Impossible de déterminer l'état du dernier arrêt.";
+
     try {
-        const response = await axios(config);
+        const { stdout } = await execAsync("last -x -n 2 shutdown reboot", { timeout: 6000 });
+        const lines = stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .filter((line) => line.startsWith("shutdown") || line.startsWith("reboot"));
+
+        const hasShutdown = lines.some((line) => line.startsWith("shutdown"));
+        const hasReboot = lines.some((line) => line.startsWith("reboot"));
+
+        if (hasShutdown) {
+            shutdownStatus = "✅ Dernier arrêt détecté comme propre (shutdown trouvé).";
+        } else if (hasReboot) {
+            shutdownStatus = "⚠️ Redémarrage sans trace de shutdown: possible coupure brutale.";
+        }
+    } catch (error) {
+        shutdownStatus = `⚠️ Analyse du journal d'arrêt indisponible (${error.message}).`;
+    }
+
+    return [
+        "🖥️ *Diagnostic Ubuntu*",
+        `- Uptime: ${uptimeMin} min`,
+        `- LoadAvg: ${loadAvg}`,
+        `- RAM: ${freeRamMb} Mo libres / ${totalRamMb} Mo`,
+        `- Arrêt précédent: ${shutdownStatus}`,
+    ].join("\n");
+}
+
+async function handleShutdownSignal(signal) {
+    if (CONFIG.role === "LOCAL") {
+        await sendAlert(
+            `🛑 *Extinction propre du système Ubuntu détectée*\nSignal reçu: ${signal}\n🕒 ${getFormattedDate()}`,
+            { parse_mode: "Markdown" }
+        );
+    }
+    process.exit(0);
+}
+
+process.on("SIGINT", () => {
+    handleShutdownSignal("SIGINT");
+});
+
+process.on("SIGTERM", () => {
+    handleShutdownSignal("SIGTERM");
+});
+
+process.on("uncaughtException", (error) => {
+    logInfo(`❌ Uncaught Exception: ${error.message}`);
+});
+
+process.on("unhandledRejection", (reason) => {
+    logInfo(`❌ Unhandled Rejection: ${reason}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Intégration qBittorrent
+// ─────────────────────────────────────────────────────────────────────────────
+const qbitHttp = axios.create({
+    baseURL: `http://${CONFIG.qbit.host}:${CONFIG.qbit.port}/api/v2`,
+    timeout: 10000,
+});
+
+async function qbitLogin() {
+    const body = new URLSearchParams({
+        username: CONFIG.qbit.username,
+        password: CONFIG.qbit.password,
+    }).toString();
+
+    const response = await qbitHttp.post("/auth/login", body, {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+
+    const cookies = response.headers["set-cookie"] || [];
+    const sidCookie = cookies.find((c) => c.startsWith("SID="));
+
+    if (!sidCookie && response.data !== "Ok.") {
+        throw new Error("Authentification qBittorrent échouée");
+    }
+
+    state.qbitSid = sidCookie ? sidCookie.split(";")[0] : null;
+}
+
+async function qbitRequest(path, method = "GET", data = null, retry = true) {
+    try {
+        if (!state.qbitSid) {
+            await qbitLogin();
+        }
+
+        const response = await qbitHttp.request({
+            url: path,
+            method,
+            headers: state.qbitSid ? { Cookie: state.qbitSid } : {},
+            data: data ? new URLSearchParams(data).toString() : undefined,
+        });
+
         return response.data;
     } catch (error) {
-        // If forbidden, try to re-login
-        if (error.response?.status === 403) {
-            state.qbConnected = false;
-            return qbRequest(endpoint, method, data);
+        if (retry && [401, 403].includes(error.response?.status || 0)) {
+            state.qbitSid = null;
+            return qbitRequest(path, method, data, false);
         }
         throw error;
     }
 }
 
-/**
- * Add a torrent to qBittorrent
- * @param {string} magnetOrUrl - Magnet link or torrent URL
- * @param {string} savePath - Download destination path
- * @returns {Promise<boolean>} - True if torrent was added successfully
- */
-async function addTorrent(magnetOrUrl, savePath) {
-    try {
-        await qbRequest("/torrents/add", "POST", {
-            urls: magnetOrUrl,
-            savepath: savePath,
-            autoTMM: "false", // Disable automatic torrent management to use our path
-        });
-        state.stats.torrentsAdded++;
-        return true;
-    } catch (error) {
-        console.error("Error adding torrent:", error.message);
-        return false;
+async function listTorrents(filter = "all") {
+    const torrents = await qbitRequest(`/torrents/info?filter=${encodeURIComponent(filter)}`);
+    return Array.isArray(torrents) ? torrents : [];
+}
+
+async function addTorrentWithOptions(options) {
+    const payload = {
+        urls: options.source,
+        savepath: options.savePath,
+        category: options.category || "",
+        paused: options.startPaused ? "true" : "false",
+        autoTMM: "false",
+    };
+
+    await qbitRequest("/torrents/add", "POST", payload);
+
+    if (options.priority && options.priority !== "normal") {
+        await applyPriorityBestEffort(options);
     }
 }
 
-/**
- * Get list of all torrents with their status
- * @returns {Promise<Array>} - List of torrent objects
- */
-async function getTorrents() {
+async function applyPriorityBestEffort(options) {
     try {
-        return await qbRequest("/torrents/info");
-    } catch (error) {
-        if (error.message.includes("authenticate")) {
-            throw new Error("Failed to authenticate with qBittorrent");
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const torrents = await listTorrents("all");
+        const candidates = torrents
+            .filter((torrent) => torrent.save_path?.startsWith(options.savePath))
+            .sort((a, b) => (b.added_on || 0) - (a.added_on || 0));
+
+        if (candidates.length === 0) return;
+
+        const hash = candidates[0].hash;
+        if (options.priority === "high") {
+            await qbitRequest("/torrents/topPrio", "POST", { hashes: hash });
         }
-        console.error("Error getting torrents:", error.message);
-        return [];
-    }
-}
-
-/**
- * Get qBittorrent transfer info (global speeds)
- * @returns {Promise<object>} - Transfer info object
- */
-async function getTransferInfo() {
-    try {
-        return await qbRequest("/transfer/info");
+        if (options.priority === "low") {
+            await qbitRequest("/torrents/bottomPrio", "POST", { hashes: hash });
+        }
     } catch (error) {
-        console.error("Error getting transfer info:", error.message);
-        return null;
+        logInfo(`⚠️ Priorité non appliquée: ${error.message}`);
     }
 }
 
-/**
- * Pause a torrent
- * @param {string} hash - Torrent hash
- */
-async function pauseTorrent(hash) {
-    await qbRequest("/torrents/pause", "POST", { hashes: hash });
+async function pauseAllTorrents() {
+    await qbitRequest("/torrents/pause", "POST", { hashes: "all" });
 }
 
-/**
- * Resume a torrent
- * @param {string} hash - Torrent hash
- */
-async function resumeTorrent(hash) {
-    await qbRequest("/torrents/resume", "POST", { hashes: hash });
+async function resumeAllTorrents() {
+    await qbitRequest("/torrents/resume", "POST", { hashes: "all" });
 }
 
-/**
- * Delete a torrent
- * @param {string} hash - Torrent hash
- * @param {boolean} deleteFiles - Whether to delete downloaded files
- */
-async function deleteTorrent(hash, deleteFiles = false) {
-    await qbRequest("/torrents/delete", "POST", { 
-        hashes: hash, 
-        deleteFiles: deleteFiles.toString() 
+async function pauseTorrentByName(name) {
+    const torrents = await listTorrents("all");
+    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    if (!torrent) throw new Error("Torrent introuvable");
+    await qbitRequest("/torrents/pause", "POST", { hashes: torrent.hash });
+    return torrent.name;
+}
+
+async function resumeTorrentByName(name) {
+    const torrents = await listTorrents("all");
+    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    if (!torrent) throw new Error("Torrent introuvable");
+    await qbitRequest("/torrents/resume", "POST", { hashes: torrent.hash });
+    return torrent.name;
+}
+
+async function deleteTorrentByName(name) {
+    const torrents = await listTorrents("all");
+    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    if (!torrent) throw new Error("Torrent introuvable");
+    await qbitRequest("/torrents/delete", "POST", { hashes: torrent.hash, deleteFiles: "false" });
+    return torrent.name;
+}
+
+async function deleteCompletedTorrents() {
+    const completed = await listTorrents("completed");
+    if (completed.length === 0) return 0;
+    const hashes = completed.map((torrent) => torrent.hash).join("|");
+    await qbitRequest("/torrents/delete", "POST", { hashes, deleteFiles: "false" });
+    return completed.length;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI Telegram torrents
+// ─────────────────────────────────────────────────────────────────────────────
+function initializeTorrentSession(chatId, source, mediaType = "movie") {
+    const defaults = {
+        movie: { savePath: CONFIG.qbit.pathMovie, category: CONFIG.qbit.categoryMovie },
+        series: { savePath: CONFIG.qbit.pathSeries, category: CONFIG.qbit.categorySeries },
+        other: { savePath: CONFIG.qbit.pathOther, category: CONFIG.qbit.categoryOther },
+    };
+
+    const selected = defaults[mediaType] || defaults.movie;
+
+    state.torrentSessions.set(chatId, {
+        source,
+        mediaType,
+        savePath: selected.savePath,
+        category: selected.category,
+        priority: "normal",
+        startPaused: false,
     });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                       DOWNLOAD MONITORING                                    ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Check for completed downloads and send notifications
- * Runs periodically to track download progress
- */
-async function checkDownloads() {
-    try {
-        const torrents = await getTorrents();
-        
-        for (const torrent of torrents) {
-            const wasActive = state.activeDownloads.has(torrent.hash);
-            const isComplete = torrent.progress === 1;
-            
-            if (wasActive && isComplete) {
-                // Download just completed!
-                bot.sendMessage(
-                    CONFIG.telegramChatId,
-                    `✅ *Download Complete!*\n\n📁 ${torrent.name}\n📦 Size: ${formatBytes(torrent.size)}\n📂 Location: \`${torrent.save_path}\``,
-                    { parse_mode: "Markdown" }
-                );
-                state.activeDownloads.delete(torrent.hash);
-            } else if (!isComplete && torrent.state !== "pausedDL" && torrent.state !== "pausedUP") {
-                // Track active downloads
-                state.activeDownloads.set(torrent.hash, torrent.name);
-            }
-        }
-    } catch (error) {
-        // Silently fail - qBittorrent might not be running
-    }
+async function askMediaType(chatId) {
+    await safeSendMessage(chatId, "🎯 Choisis le type de contenu:", {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: "🎬 Film", callback_data: "tw:type:movie" },
+                    { text: "📺 Série", callback_data: "tw:type:series" },
+                ],
+                [{ text: "📦 Autre", callback_data: "tw:type:other" }],
+                [{ text: "❌ Annuler", callback_data: "tw:cancel" }],
+            ],
+        },
+    });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                         TELEGRAM COMMANDS                                    ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * /start - Welcome message and bot introduction
- */
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    const welcomeMessage = `
-🎬 *Welcome to MyPlexMonitor!*
-
-I'm your personal Plex server assistant. Here's what I can do:
-
-📡 *Monitoring*
-• Real-time server status monitoring
-• Automatic alerts when server goes down/up
-
-🎬 *Plex Features*
-• View recently added movies and shows
-• Browse your library statistics
-• Get server information
-
-📥 *Download Management*
-• Add torrents directly via magnet links
-• Track download progress
-• Get notified when downloads complete
-
-Type /help to see all available commands!
-
-_Your Chat ID: \`${chatId}\`_
-_Your User ID: \`${msg.from.id}\`_
-    `;
-    
-    bot.sendMessage(chatId, welcomeMessage, { parse_mode: "Markdown" });
-});
-
-/**
- * /check - Manual server status check
- */
-bot.onText(/\/check/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    bot.sendMessage(chatId, "🔎 Checking server status...");
-    
-    pingServer((isOnline, reason) => {
-        state.lastCheck = new Date().toISOString();
-        state.stats.checksPerformed++;
-        
-        if (isOnline) {
-            bot.sendMessage(
-                chatId,
-                `🟢 *Server Status: ONLINE*\n\n📡 Server: \`${CONFIG.serverIp}:${CONFIG.plexPort}\`\n⏰ Last check: ${new Date().toLocaleString()}`,
-                { parse_mode: "Markdown" }
-            );
-            state.isServerOnline = true;
-        } else {
-            bot.sendMessage(
-                chatId,
-                `🔴 *Server Status: OFFLINE*\n\n📡 Server: \`${CONFIG.serverIp}:${CONFIG.plexPort}\`\n❌ Reason: ${reason}`,
-                { parse_mode: "Markdown" }
-            );
-            state.isServerOnline = false;
-        }
+async function askSavePath(chatId) {
+    await safeSendMessage(chatId, "📂 Choisis le dossier de destination:", {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: "🎬 Dossier Films", callback_data: "tw:path:movie" }],
+                [{ text: "📺 Dossier Séries", callback_data: "tw:path:series" }],
+                [{ text: "📦 Dossier Autre", callback_data: "tw:path:other" }],
+                [{ text: "✍️ Saisir un chemin personnalisé", callback_data: "tw:path:custom" }],
+            ],
+        },
     });
-});
+}
 
-/**
- * /recent - Show recently added content from Plex
- */
-bot.onText(/\/recent(?:\s+(\d+))?/, (msg, match) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    const limit = parseInt(match[1]) || 10; // Default to 10 items
-    bot.sendMessage(chatId, "🔎 Retrieving recently added items...");
-    
-    plexClient
-        .query("/library/recentlyAdded")
-        .then((result) => {
-            const items = result.MediaContainer.Metadata;
-            
-            if (items && items.length > 0) {
-                const limitedItems = items.slice(0, Math.min(limit, 20)); // Max 20 items
-                let message = `🆕 *Recently Added* (${limitedItems.length}/${items.length}):\n\n`;
-                
-                limitedItems.forEach((item, index) => {
-                    if (item.type === "movie") {
-                        const rating = item.rating ? ` ⭐ ${item.rating.toFixed(1)}` : "";
-                        message += `${index + 1}. 🎬 *${item.title}* (${item.year || "N/A"})${rating}\n`;
-                    } else if (item.type === "episode") {
-                        const episode = `S${String(item.parentIndex).padStart(2, "0")}E${String(item.index).padStart(2, "0")}`;
-                        message += `${index + 1}. 📺 *${item.grandparentTitle}* - ${episode}\n   └─ _${item.title}_\n`;
-                    } else if (item.type === "season") {
-                        message += `${index + 1}. 📺 *${item.parentTitle}* - ${item.title}\n`;
-                    } else {
-                        message += `${index + 1}. ✨ *${item.title}*\n`;
-                    }
-                });
-                
-                message += `\n_Use /recent <number> to see more items_`;
-                bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-            } else {
-                bot.sendMessage(chatId, "📭 No recently added items found.");
-            }
-        })
-        .catch((err) => {
-            console.error("Plex API error:", err);
-            bot.sendMessage(
-                chatId,
-                "🔴 *Error*\n\nFailed to retrieve recently added items.\nCheck your PLEX_TOKEN and server connection.",
-                { parse_mode: "Markdown" }
-            );
-        });
-});
+async function askCategory(chatId) {
+    await safeSendMessage(chatId, "🏷️ Choisis une catégorie qBittorrent:", {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: "🎬 movies", callback_data: "tw:cat:movie" },
+                    { text: "📺 series", callback_data: "tw:cat:series" },
+                ],
+                [
+                    { text: "📦 other", callback_data: "tw:cat:other" },
+                    { text: "➖ Aucune", callback_data: "tw:cat:none" },
+                ],
+            ],
+        },
+    });
+}
 
-/**
- * /stats - Show Plex library statistics
- */
-bot.onText(/\/stats/, async (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    bot.sendMessage(chatId, "📊 Gathering library statistics...");
-    
-    try {
-        const libraries = await plexClient.query("/library/sections");
-        let message = "📊 *Plex Library Statistics*\n\n";
-        
-        for (const section of libraries.MediaContainer.Directory) {
-            const details = await plexClient.query(`/library/sections/${section.key}/all`);
-            const count = details.MediaContainer.size || 0;
-            
-            let icon = "📁";
-            if (section.type === "movie") icon = "🎬";
-            else if (section.type === "show") icon = "📺";
-            else if (section.type === "artist") icon = "🎵";
-            else if (section.type === "photo") icon = "📷";
-            
-            message += `${icon} *${section.title}*: ${count} items\n`;
-        }
-        
-        // Add bot statistics
-        const uptime = Math.floor((Date.now() - state.stats.botStartTime.getTime()) / 1000);
-        message += `\n🤖 *Bot Statistics*\n`;
-        message += `├ Uptime: ${formatDuration(uptime)}\n`;
-        message += `├ Checks: ${state.stats.checksPerformed}\n`;
-        message += `├ Alerts: ${state.stats.alertsSent}\n`;
-        message += `└ Torrents added: ${state.stats.torrentsAdded}`;
-        
-        bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-    } catch (err) {
-        console.error("Plex API error:", err);
-        bot.sendMessage(
-            chatId,
-            "🔴 *Error*\n\nFailed to retrieve library statistics.",
-            { parse_mode: "Markdown" }
-        );
-    }
-});
+async function askPriority(chatId) {
+    await safeSendMessage(chatId, "⚡ Choisis la priorité de file:", {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: "🔺 Haute", callback_data: "tw:prio:high" },
+                    { text: "⏺️ Normale", callback_data: "tw:prio:normal" },
+                    { text: "🔻 Basse", callback_data: "tw:prio:low" },
+                ],
+            ],
+        },
+    });
+}
 
-/**
- * /torrent or /download - Add a torrent with interactive type selection
- */
-bot.onText(/\/(torrent|download|dl)(?:\s+(.+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    
-    if (!isAuthorized(userId)) {
-        return sendUnauthorizedMessage(chatId);
+async function askStartMode(chatId) {
+    await safeSendMessage(chatId, "▶️ Démarrage du torrent:", {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: "▶️ Démarrer tout de suite", callback_data: "tw:paused:false" },
+                    { text: "⏸️ Ajouter en pause", callback_data: "tw:paused:true" },
+                ],
+            ],
+        },
+    });
+}
+
+function buildTorrentSummary(session) {
+    return [
+        "✅ *Récapitulatif du torrent*",
+        `- Type: ${session.mediaType}`,
+        `- Dossier: \`${session.savePath}\``,
+        `- Catégorie: ${session.category || "aucune"}`,
+        `- Priorité: ${session.priority}`,
+        `- Démarrage: ${session.startPaused ? "en pause" : "immédiat"}`,
+    ].join("\n");
+}
+
+async function askConfirmation(chatId, session) {
+    await safeSendMessage(chatId, buildTorrentSummary(session), {
+        parse_mode: "Markdown",
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: "✅ Confirmer l'ajout", callback_data: "tw:confirm" },
+                    { text: "✏️ Modifier dossier", callback_data: "tw:path:custom" },
+                ],
+                [{ text: "❌ Annuler", callback_data: "tw:cancel" }],
+            ],
+        },
+    });
+}
+
+function parseFilterArg(rawArg) {
+    const normalized = (rawArg || "all").toLowerCase();
+    if (["active", "actif", "actifs"].includes(normalized)) return "downloading";
+    if (["paused", "pause"].includes(normalized)) return "paused";
+    if (["completed", "done", "termine", "terminé", "finished"].includes(normalized)) return "completed";
+    return "all";
+}
+
+async function renderDownloads(chatId, filter = "all", page = 0, editMeta = null) {
+    const torrents = await listTorrents(filter);
+    const pageSize = 5;
+    const totalPages = Math.max(1, Math.ceil(torrents.length / pageSize));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const startIndex = safePage * pageSize;
+    const pageItems = torrents.slice(startIndex, startIndex + pageSize);
+
+    state.downloadsView.set(chatId, { filter, page: safePage });
+
+    let message = `📥 *Téléchargements* (${filter})\nPage ${safePage + 1}/${totalPages}\n\n`;
+
+    if (pageItems.length === 0) {
+        message += "Aucun torrent pour ce filtre.";
     }
-    
-    const magnetLink = match[2];
-    
-    if (!magnetLink) {
-        bot.sendMessage(
-            chatId,
-            "📥 *Add Torrent*\n\nUsage: `/torrent <magnet_link>`\nor `/dl <magnet_link>`\n\nYou can also use:\n• `/movie <magnet>` - Download as movie\n• `/series <magnet>` - Download as series",
-            { parse_mode: "Markdown" }
-        );
-        return;
+
+    for (const torrent of pageItems) {
+        const percent = Math.round((torrent.progress || 0) * 100);
+        const eta = torrent.eta > 0 ? formatDuration(torrent.eta) : "n/a";
+        message += [
+            `*${torrent.name.replace(/\*/g, "")}*`,
+            `${getTorrentStatusLabel(torrent.state)} ${createProgressBar(percent)} ${percent}%`,
+            `⬇️ ${formatBytes(torrent.dlspeed || 0)}/s | ⬆️ ${formatBytes(torrent.upspeed || 0)}/s | ETA ${eta}`,
+            "",
+        ].join("\n");
     }
-    
-    // Validate it's a magnet link
-    if (!magnetLink.startsWith("magnet:")) {
-        bot.sendMessage(
-            chatId,
-            "❌ *Invalid Link*\n\nPlease provide a valid magnet link starting with `magnet:`",
-            { parse_mode: "Markdown" }
-        );
-        return;
-    }
-    
-    // Store the magnet link and ask for content type
-    state.userStates.set(userId, { magnetLink, step: "select_type" });
-    
+
     const keyboard = {
         inline_keyboard: [
             [
-                { text: "🎬 Movie", callback_data: "torrent_movie" },
-                { text: "📺 Series", callback_data: "torrent_series" },
+                { text: "⬅️", callback_data: "dl:page:prev" },
+                { text: "🔄 Rafraîchir", callback_data: "dl:refresh" },
+                { text: "➡️", callback_data: "dl:page:next" },
             ],
             [
-                { text: "❌ Cancel", callback_data: "torrent_cancel" },
+                { text: "Actifs", callback_data: "dl:filter:downloading" },
+                { text: "En pause", callback_data: "dl:filter:paused" },
+                { text: "Terminés", callback_data: "dl:filter:completed" },
             ],
+            [
+                { text: "⏸️ Tout pause", callback_data: "dl:batch:pause" },
+                { text: "▶️ Tout reprendre", callback_data: "dl:batch:resume" },
+            ],
+            [{ text: "🗑️ Supprimer terminés", callback_data: "dl:batch:cleanup" }],
         ],
     };
-    
-    // Try to extract name from magnet link
-    let torrentName = "Unknown";
-    const dnMatch = magnetLink.match(/dn=([^&]+)/);
-    if (dnMatch) {
-        torrentName = decodeURIComponent(dnMatch[1].replace(/\+/g, " "));
+
+    if (editMeta) {
+        await bot.editMessageText(message, {
+            chat_id: editMeta.chatId,
+            message_id: editMeta.messageId,
+            parse_mode: "Markdown",
+            reply_markup: keyboard,
+        });
+        return;
     }
-    
-    bot.sendMessage(
+
+    await safeSendMessage(chatId, message, { parse_mode: "Markdown", reply_markup: keyboard });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commandes Telegram
+// ─────────────────────────────────────────────────────────────────────────────
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    await safeSendMessage(
         chatId,
-        `📥 *New Download*\n\n📁 *Name:* ${torrentName}\n\nWhere should this be saved?`,
-        { parse_mode: "Markdown", reply_markup: keyboard }
+        `👋 *MyPlexMonitor prêt*\n\nRôle actif: *${CONFIG.role}*\n\nUtilise /help pour voir toutes les commandes.`,
+        { parse_mode: "Markdown" }
     );
 });
 
-/**
- * /movie - Quick add torrent as movie
- */
-bot.onText(/\/movie(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/help/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    const magnetLink = match[1];
-    
-    if (!magnetLink || !magnetLink.startsWith("magnet:")) {
-        bot.sendMessage(
-            chatId,
-            "🎬 *Add Movie*\n\nUsage: `/movie <magnet_link>`",
-            { parse_mode: "Markdown" }
-        );
-        return;
-    }
-    
-    await handleTorrentAdd(chatId, magnetLink, "movie");
+    const text = [
+        `📚 *Commandes disponibles* (rôle: ${CONFIG.role})`,
+        "",
+        "📡 Monitoring",
+        "- /check",
+        "- /restart_plex",
+        "",
+        "📥 Torrents",
+        "- /torrent <magnet|url>",
+        "- /movie <magnet|url>",
+        "- /series <magnet|url>",
+        "- /downloads [all|active|paused|completed]",
+        "- /pause [nom]",
+        "- /resume [nom]",
+        "- /delete <nom>",
+        "",
+        "💡 Le mode BACKUP n'écoute Telegram que pendant une panne Ubuntu.",
+    ].join("\n");
+    await safeSendMessage(chatId, text, { parse_mode: "Markdown" });
 });
 
-/**
- * /series - Quick add torrent as series
- */
-bot.onText(/\/series(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/check/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    const magnetLink = match[1];
-    
-    if (!magnetLink || !magnetLink.startsWith("magnet:")) {
-        bot.sendMessage(
-            chatId,
-            "📺 *Add Series*\n\nUsage: `/series <magnet_link>`",
-            { parse_mode: "Markdown" }
-        );
-        return;
-    }
-    
-    await handleTorrentAdd(chatId, magnetLink, "series");
-});
 
-/**
- * Handle torrent addition with path selection
- * @param {number} chatId - Telegram chat ID
- * @param {string} magnetLink - Magnet link
- * @param {string} type - Content type ("movie" or "series")
- */
-async function handleTorrentAdd(chatId, magnetLink, type) {
-    const savePath = type === "movie" ? CONFIG.paths.movies : CONFIG.paths.series;
-    const emoji = type === "movie" ? "🎬" : "📺";
-    
-    bot.sendMessage(chatId, `${emoji} Adding ${type} to download queue...`);
-    
     try {
-        const success = await addTorrent(magnetLink, savePath);
-        
-        if (success) {
-            // Extract name from magnet
-            let torrentName = "Unknown";
-            const dnMatch = magnetLink.match(/dn=([^&]+)/);
-            if (dnMatch) {
-                torrentName = decodeURIComponent(dnMatch[1].replace(/\+/g, " "));
-            }
-            
-            bot.sendMessage(
+        const result = await pingServer();
+        const statusLine = result.online ? "🟢 ONLINE" : "🔴 OFFLINE";
+
+        if (CONFIG.role === "LOCAL") {
+            const diagnostics = await getUbuntuDiagnostics();
+            await safeSendMessage(
                 chatId,
-                `✅ *Download Started!*\n\n${emoji} *Type:* ${type.charAt(0).toUpperCase() + type.slice(1)}\n📁 *Name:* ${torrentName}\n📂 *Path:* \`${savePath}\`\n\nUse /downloads to check progress.`,
+                `🔎 *Vérification immédiate*\nStatut Plex: ${statusLine}\nCause technique: ${result.reason}\n🕒 ${getFormattedDate()}\n\n${diagnostics}`,
                 { parse_mode: "Markdown" }
             );
-        } else {
-            throw new Error("Failed to add torrent");
-        }
-    } catch (error) {
-        bot.sendMessage(
-            chatId,
-            `❌ *Error*\n\nFailed to add torrent. Make sure qBittorrent is running.\n\n_Error: ${error.message}_`,
-            { parse_mode: "Markdown" }
-        );
-    }
-}
-
-/**
- * /downloads - Show current downloads
- */
-bot.onText(/\/downloads?/, async (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    bot.sendMessage(chatId, "📥 Fetching download status...");
-    
-    try {
-        const torrents = await getTorrents();
-        const transferInfo = await getTransferInfo();
-        
-        if (!torrents || torrents.length === 0) {
-            bot.sendMessage(chatId, "📭 No active downloads.");
             return;
         }
-        
-        // Sort by progress (active first)
-        torrents.sort((a, b) => {
-            if (a.progress === 1 && b.progress !== 1) return 1;
-            if (a.progress !== 1 && b.progress === 1) return -1;
-            return b.progress - a.progress;
-        });
-        
-        let message = "📥 *Downloads*\n\n";
-        
-        // Global speeds
-        if (transferInfo) {
-            message += `⬇️ ${formatBytes(transferInfo.dl_info_speed)}/s | ⬆️ ${formatBytes(transferInfo.up_info_speed)}/s\n\n`;
-        }
-        
-        // Show first 10 torrents
-        const displayTorrents = torrents.slice(0, 10);
-        
-        for (const torrent of displayTorrents) {
-            const progress = Math.round(torrent.progress * 100);
-            const progressBar = createProgressBar(progress);
-            const status = getStatusEmoji(torrent.state);
-            
-            // Truncate name if too long
-            const name = torrent.name.length > 35 
-                ? torrent.name.substring(0, 35) + "..." 
-                : torrent.name;
-            
-            message += `${status} *${name}*\n`;
-            message += `${progressBar} ${progress}%`;
-            
-            if (torrent.progress < 1 && torrent.dlspeed > 0) {
-                message += ` | ⬇️ ${formatBytes(torrent.dlspeed)}/s`;
-                if (torrent.eta > 0) {
-                    message += ` | ⏱️ ${formatDuration(torrent.eta)}`;
-                }
-            }
-            
-            message += `\n\n`;
-        }
-        
-        if (torrents.length > 10) {
-            message += `_...and ${torrents.length - 10} more torrents_`;
-        }
-        
-        bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-    } catch (error) {
-        bot.sendMessage(
+
+        await safeSendMessage(
             chatId,
-            `❌ *Error*\n\nFailed to get download status.\nMake sure qBittorrent is running on \`${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}\``,
+            [
+                "🔎 *Vérification BACKUP*",
+                `Statut distant Plex: ${statusLine}`,
+                `Cause technique: ${result.reason}`,
+                `Dernière panne mémorisée: ${state.lastDownTime || "inconnue"}`,
+                `Raison mémorisée: ${state.lastDownReason || "non déterminée"}`,
+                `Horodatage: ${getFormattedDate()}`,
+            ].join("\n"),
             { parse_mode: "Markdown" }
         );
-    }
-});
-
-/**
- * Get status emoji based on torrent state
- * @param {string} state - Torrent state string
- * @returns {string} - Emoji representing the state
- */
-function getStatusEmoji(state) {
-    const stateMap = {
-        downloading: "⬇️",
-        uploading: "⬆️",
-        stalledDL: "⏳",
-        stalledUP: "📤",
-        pausedDL: "⏸️",
-        pausedUP: "⏸️",
-        queuedDL: "📋",
-        queuedUP: "📋",
-        checkingDL: "🔍",
-        checkingUP: "🔍",
-        checkingResumeData: "🔍",
-        moving: "📦",
-        error: "❌",
-        missingFiles: "⚠️",
-        allocating: "📝",
-        metaDL: "🔎",
-        forcedDL: "⏬",
-        forcedUP: "⏫",
-    };
-    return stateMap[state] || "❓";
-}
-
-/**
- * /pause - Pause all or specific torrent
- */
-bot.onText(/\/pause(?:\s+(.+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    try {
-        if (match[1]) {
-            // Pause specific torrent by name
-            const torrents = await getTorrents();
-            const torrent = torrents.find(t => 
-                t.name.toLowerCase().includes(match[1].toLowerCase())
-            );
-            
-            if (torrent) {
-                await pauseTorrent(torrent.hash);
-                bot.sendMessage(chatId, `⏸️ Paused: *${torrent.name}*`, { parse_mode: "Markdown" });
-            } else {
-                bot.sendMessage(chatId, "❌ Torrent not found.");
-            }
-        } else {
-            // Pause all
-            await qbRequest("/torrents/pause", "POST", { hashes: "all" });
-            bot.sendMessage(chatId, "⏸️ All downloads paused.");
-        }
     } catch (error) {
-        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        await safeSendMessage(chatId, `❌ Erreur pendant /check: ${error.message}`);
     }
 });
 
-/**
- * /resume - Resume all or specific torrent
- */
-bot.onText(/\/resume(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/restart_plex/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    try {
-        if (match[1]) {
-            // Resume specific torrent by name
-            const torrents = await getTorrents();
-            const torrent = torrents.find(t => 
-                t.name.toLowerCase().includes(match[1].toLowerCase())
-            );
-            
-            if (torrent) {
-                await resumeTorrent(torrent.hash);
-                bot.sendMessage(chatId, `▶️ Resumed: *${torrent.name}*`, { parse_mode: "Markdown" });
-            } else {
-                bot.sendMessage(chatId, "❌ Torrent not found.");
-            }
-        } else {
-            // Resume all
-            await qbRequest("/torrents/resume", "POST", { hashes: "all" });
-            bot.sendMessage(chatId, "▶️ All downloads resumed.");
-        }
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-    }
-});
 
-/**
- * /delete - Delete a torrent
- */
-bot.onText(/\/delete(?:\s+(.+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    
-    if (!isAuthorized(userId)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    if (!match[1]) {
-        bot.sendMessage(
+    if (CONFIG.role === "BACKUP") {
+        await safeSendMessage(
             chatId,
-            "🗑️ *Delete Torrent*\n\nUsage: `/delete <torrent_name>`\n\n_Use /downloads to see torrent names_",
-            { parse_mode: "Markdown" }
+            "❌ Impossible: redémarrage logiciel indisponible car le serveur Ubuntu physique est hors ligne."
         );
         return;
     }
-    
+
     try {
-        const torrents = await getTorrents();
-        const torrent = torrents.find(t => 
-            t.name.toLowerCase().includes(match[1].toLowerCase())
-        );
-        
-        if (torrent) {
-            // Store for confirmation
-            state.userStates.set(userId, { 
-                hash: torrent.hash, 
-                name: torrent.name,
-                step: "confirm_delete" 
-            });
-            
-            const keyboard = {
-                inline_keyboard: [
-                    [
-                        { text: "🗑️ Delete (keep files)", callback_data: "delete_keep" },
-                        { text: "🔥 Delete with files", callback_data: "delete_files" },
-                    ],
-                    [
-                        { text: "❌ Cancel", callback_data: "delete_cancel" },
-                    ],
-                ],
-            };
-            
-            bot.sendMessage(
+        await safeSendMessage(chatId, "♻️ Redémarrage de plexmediaserver en cours...");
+        await execAsync("sudo systemctl restart plexmediaserver", { timeout: 20000 });
+        await safeSendMessage(chatId, "✅ Commande systemctl exécutée. Vérification dans 5 secondes...");
+
+        setTimeout(async () => {
+            const result = await pingServer();
+            await safeSendMessage(
                 chatId,
-                `🗑️ *Delete Torrent?*\n\n📁 *${torrent.name}*\n📦 Size: ${formatBytes(torrent.size)}`,
-                { parse_mode: "Markdown", reply_markup: keyboard }
+                result.online
+                    ? `✅ Plex répond à nouveau après redémarrage. (${getFormattedDate()})`
+                    : `⚠️ Plex ne répond toujours pas: ${result.reason} (${getFormattedDate()})`
             );
-        } else {
-            bot.sendMessage(chatId, "❌ Torrent not found.");
-        }
+        }, 5000);
     } catch (error) {
-        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        await safeSendMessage(chatId, `❌ Échec du redémarrage: ${error.message}`);
     }
 });
 
-/**
- * /server - Show server system information
- */
-bot.onText(/\/server/, async (msg) => {
+bot.onText(/\/torrent(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    bot.sendMessage(chatId, "🔄 Fetching server information...");
-    
-    // Get qBittorrent disk info (this is from the actual media server!)
-    let diskInfo = null;
-    try {
-        const mainData = await qbRequest("/sync/maindata");
-        if (mainData && mainData.server_state) {
-            diskInfo = {
-                freeSpace: mainData.server_state.free_space_on_disk,
-                dlSpeed: mainData.server_state.dl_info_speed,
-                upSpeed: mainData.server_state.up_info_speed,
-                totalDownloaded: mainData.server_state.alltime_dl,
-                totalUploaded: mainData.server_state.alltime_ul,
-            };
-        }
-    } catch (err) {
-        console.log("Could not get qBittorrent disk info:", err.message);
-    }
-    
-    // Build the message
-    let message = `
-🖥️ *Server Information*
+    const source = (match?.[1] || "").trim();
 
-📡 *Plex Server:* \`${CONFIG.serverIp}:${CONFIG.plexPort}\`
-${state.isServerOnline ? "🟢" : "🔴"} Status: ${state.isServerOnline ? "Online" : "Offline"}
-
-📥 *qBittorrent:* \`${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}\`
-${state.qbConnected ? "🟢" : "🔴"} Status: ${state.qbConnected ? "Connected" : "Disconnected"}`;
-
-    // Add disk info if available (from the actual media server!)
-    if (diskInfo) {
-        message += `
-
-💾 *Media Server Disk* (from qBittorrent)
-├ Free Space: ${formatBytes(diskInfo.freeSpace)}
-├ ⬇️ Current: ${formatBytes(diskInfo.dlSpeed)}/s
-└ ⬆️ Current: ${formatBytes(diskInfo.upSpeed)}/s
-
-📊 *All-time Stats*
-├ Downloaded: ${formatBytes(diskInfo.totalDownloaded)}
-└ Uploaded: ${formatBytes(diskInfo.totalUploaded)}`;
-    }
-
-    message += `
-
-📂 *Download Paths*
-├ Movies: \`${CONFIG.paths.movies}\`
-└ Series: \`${CONFIG.paths.series}\`
-
-⏱️ *Bot Uptime:* ${formatDuration(Math.floor((Date.now() - state.stats.botStartTime.getTime()) / 1000))}
-    `;
-    
-    bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-});
-
-/**
- * /search - Search on your Plex library
- */
-bot.onText(/\/search(?:\s+(.+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
-    }
-    
-    const query = match[1];
-    
-    if (!query) {
-        bot.sendMessage(
-            chatId,
-            "🔍 *Search Library*\n\nUsage: `/search <movie or show name>`",
-            { parse_mode: "Markdown" }
-        );
+    if (!source) {
+        await safeSendMessage(chatId, "Usage: /torrent <magnet|url>");
         return;
     }
-    
-    bot.sendMessage(chatId, `🔍 Searching for "${query}"...`);
-    
+
+    initializeTorrentSession(chatId, source, "movie");
+    await askMediaType(chatId);
+});
+
+bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const source = (match?.[1] || "").trim();
+    if (!source) {
+        await safeSendMessage(chatId, "Usage: /movie <magnet|url>");
+        return;
+    }
+    initializeTorrentSession(chatId, source, "movie");
+    await askSavePath(chatId);
+});
+
+bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const source = (match?.[1] || "").trim();
+    if (!source) {
+        await safeSendMessage(chatId, "Usage: /series <magnet|url>");
+        return;
+    }
+    initializeTorrentSession(chatId, source, "series");
+    await askSavePath(chatId);
+});
+
+bot.onText(/\/downloads?(?:\s+(\S+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const filter = parseFilterArg(match?.[1]);
+
     try {
-        const result = await plexClient.query(`/search?query=${encodeURIComponent(query)}`);
-        const items = result.MediaContainer.Metadata;
-        
-        if (items && items.length > 0) {
-            let message = `🔍 *Search Results for "${query}":*\n\n`;
-            
-            const limitedItems = items.slice(0, 10);
-            
-            for (const item of limitedItems) {
-                if (item.type === "movie") {
-                    const rating = item.rating ? ` ⭐ ${item.rating.toFixed(1)}` : "";
-                    message += `🎬 *${item.title}* (${item.year || "N/A"})${rating}\n`;
-                } else if (item.type === "show") {
-                    message += `📺 *${item.title}* (${item.year || "N/A"})\n`;
-                } else if (item.type === "episode") {
-                    const episode = `S${String(item.parentIndex).padStart(2, "0")}E${String(item.index).padStart(2, "0")}`;
-                    message += `📺 *${item.grandparentTitle}* - ${episode}: ${item.title}\n`;
+        await renderDownloads(chatId, filter, 0);
+    } catch (error) {
+        await safeSendMessage(chatId, `❌ Impossible de charger les torrents: ${error.message}`);
+    }
+});
+
+bot.onText(/\/pause(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const name = (match?.[1] || "").trim();
+
+    try {
+        if (!name) {
+            await pauseAllTorrents();
+            await safeSendMessage(chatId, "⏸️ Tous les torrents sont en pause.");
+            return;
+        }
+
+        const pausedName = await pauseTorrentByName(name);
+        await safeSendMessage(chatId, `⏸️ Torrent en pause: ${pausedName}`);
+    } catch (error) {
+        await safeSendMessage(chatId, `❌ /pause: ${error.message}`);
+    }
+});
+
+bot.onText(/\/resume(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const name = (match?.[1] || "").trim();
+
+    try {
+        if (!name) {
+            await resumeAllTorrents();
+            await safeSendMessage(chatId, "▶️ Tous les torrents reprennent.");
+            return;
+        }
+
+        const resumedName = await resumeTorrentByName(name);
+        await safeSendMessage(chatId, `▶️ Torrent repris: ${resumedName}`);
+    } catch (error) {
+        await safeSendMessage(chatId, `❌ /resume: ${error.message}`);
+    }
+});
+
+bot.onText(/\/delete(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const name = (match?.[1] || "").trim();
+
+    if (!name) {
+        await safeSendMessage(chatId, "Usage: /delete <nom_du_torrent>");
+        return;
+    }
+
+    try {
+        const deletedName = await deleteTorrentByName(name);
+        await safeSendMessage(chatId, `🗑️ Torrent supprimé (fichiers conservés): ${deletedName}`);
+    } catch (error) {
+        await safeSendMessage(chatId, `❌ /delete: ${error.message}`);
+    }
+});
+
+bot.on("message", async (msg) => {
+    const chatId = msg.chat.id;
+    if (!msg.text || msg.text.startsWith("/")) return;
+
+    if (!state.awaitingCustomPath.has(chatId)) return;
+
+    const session = state.torrentSessions.get(chatId);
+    if (!session) {
+        state.awaitingCustomPath.delete(chatId);
+        return;
+    }
+
+    session.savePath = msg.text.trim();
+    state.awaitingCustomPath.delete(chatId);
+    await askCategory(chatId);
+});
+
+bot.on("callback_query", async (query) => {
+    const chatId = query.message?.chat?.id;
+    const messageId = query.message?.message_id;
+    const data = query.data;
+
+    if (!chatId || !data) return;
+
+    await bot.answerCallbackQuery(query.id).catch(() => null);
+
+    try {
+        if (data.startsWith("tw:")) {
+            const session = state.torrentSessions.get(chatId);
+            if (!session && data !== "tw:cancel") {
+                await safeSendMessage(chatId, "⚠️ Session expirée, relance /torrent.");
+                return;
+            }
+
+            if (data === "tw:cancel") {
+                state.torrentSessions.delete(chatId);
+                state.awaitingCustomPath.delete(chatId);
+                await safeSendMessage(chatId, "❌ Ajout du torrent annulé.");
+                return;
+            }
+
+            if (data.startsWith("tw:type:")) {
+                const mediaType = data.split(":")[2];
+                initializeTorrentSession(chatId, session.source, mediaType);
+                await askSavePath(chatId);
+                return;
+            }
+
+            if (data.startsWith("tw:path:")) {
+                const pathType = data.split(":")[2];
+                if (pathType === "custom") {
+                    state.awaitingCustomPath.add(chatId);
+                    await safeSendMessage(chatId, "✍️ Envoie maintenant le chemin complet (ex: /mnt/films/custom).", {
+                        reply_markup: { force_reply: true },
+                    });
+                    return;
                 }
+
+                if (pathType === "movie") session.savePath = CONFIG.qbit.pathMovie;
+                if (pathType === "series") session.savePath = CONFIG.qbit.pathSeries;
+                if (pathType === "other") session.savePath = CONFIG.qbit.pathOther;
+                await askCategory(chatId);
+                return;
             }
-            
-            if (items.length > 10) {
-                message += `\n_...and ${items.length - 10} more results_`;
+
+            if (data.startsWith("tw:cat:")) {
+                const cat = data.split(":")[2];
+                session.category = cat === "none"
+                    ? ""
+                    : cat === "movie"
+                        ? CONFIG.qbit.categoryMovie
+                        : cat === "series"
+                            ? CONFIG.qbit.categorySeries
+                            : CONFIG.qbit.categoryOther;
+                await askPriority(chatId);
+                return;
             }
-            
-            bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-        } else {
-            bot.sendMessage(chatId, `📭 No results found for "${query}".`);
+
+            if (data.startsWith("tw:prio:")) {
+                session.priority = data.split(":")[2];
+                await askStartMode(chatId);
+                return;
+            }
+
+            if (data.startsWith("tw:paused:")) {
+                const pausedFlag = data.split(":")[2] === "true";
+                session.startPaused = pausedFlag;
+                await askConfirmation(chatId, session);
+                return;
+            }
+
+            if (data === "tw:confirm") {
+                await addTorrentWithOptions(session);
+                state.torrentSessions.delete(chatId);
+                state.awaitingCustomPath.delete(chatId);
+
+                await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: "📥 Voir les torrents", callback_data: "dl:refresh" },
+                                { text: "⏸️ Pause tout", callback_data: "dl:batch:pause" },
+                            ],
+                            [
+                                { text: "▶️ Reprendre tout", callback_data: "dl:batch:resume" },
+                                { text: "🗑️ Nettoyer terminés", callback_data: "dl:batch:cleanup" },
+                            ],
+                        ],
+                    },
+                });
+                return;
+            }
+        }
+
+        if (data.startsWith("dl:")) {
+            const view = state.downloadsView.get(chatId) || { filter: "all", page: 0 };
+
+            if (data === "dl:refresh") {
+                await renderDownloads(chatId, view.filter, view.page, { chatId, messageId });
+                return;
+            }
+
+            if (data === "dl:page:next") {
+                await renderDownloads(chatId, view.filter, view.page + 1, { chatId, messageId });
+                return;
+            }
+
+            if (data === "dl:page:prev") {
+                await renderDownloads(chatId, view.filter, view.page - 1, { chatId, messageId });
+                return;
+            }
+
+            if (data.startsWith("dl:filter:")) {
+                const filter = data.split(":")[2] || "all";
+                await renderDownloads(chatId, filter, 0, { chatId, messageId });
+                return;
+            }
+
+            if (data === "dl:batch:pause") {
+                await pauseAllTorrents();
+                await safeSendMessage(chatId, "⏸️ Action lot: tous les torrents en pause.");
+                return;
+            }
+
+            if (data === "dl:batch:resume") {
+                await resumeAllTorrents();
+                await safeSendMessage(chatId, "▶️ Action lot: reprise de tous les torrents.");
+                return;
+            }
+
+            if (data === "dl:batch:cleanup") {
+                const deletedCount = await deleteCompletedTorrents();
+                await safeSendMessage(chatId, `🗑️ ${deletedCount} torrent(s) terminés supprimé(s).`);
+                return;
+            }
         }
     } catch (error) {
-        console.error("Search error:", error);
-        bot.sendMessage(chatId, "❌ Error searching library.");
+        await safeSendMessage(chatId, `❌ Erreur action bouton: ${error.message}`);
     }
 });
 
-/**
- * /help - Show all available commands
- */
-bot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!isAuthorized(msg.from.id)) {
-        return sendUnauthorizedMessage(chatId);
+// ─────────────────────────────────────────────────────────────────────────────
+// Démarrage
+// ─────────────────────────────────────────────────────────────────────────────
+(async () => {
+    logInfo(`🚀 MyPlexMonitor démarré en mode ${CONFIG.role}.`);
+
+    if (CONFIG.role === "LOCAL") {
+        const diagnostics = await getUbuntuDiagnostics();
+        await sendAlert(
+            `✅ *Démarrage MyPlexMonitor (LOCAL)*\n\n${diagnostics}\n\n🕒 ${getFormattedDate()}`,
+            { parse_mode: "Markdown" }
+        );
     }
-    
-    const helpMessage = `
-📚 *MyPlexMonitor Commands*
 
-📡 *Monitoring*
-├ /check - Check Plex server status
-├ /server - Show server system info
-└ /stats - Library statistics
-
-🎬 *Plex Library*
-├ /recent [n] - Recently added (n items)
-└ /search <query> - Search library
-
-📥 *Downloads (qBittorrent)*
-├ /torrent <magnet> - Add torrent (interactive)
-├ /movie <magnet> - Add as movie
-├ /series <magnet> - Add as series
-├ /downloads - View active downloads
-├ /pause [name] - Pause all/one
-├ /resume [name] - Resume all/one
-└ /delete <name> - Delete torrent
-
-ℹ️ *Other*
-├ /start - Welcome message
-└ /help - This help message
-
-📂 *Download Paths*
-├ Movies: \`${CONFIG.paths.movies}\`
-└ Series: \`${CONFIG.paths.series}\`
-    `;
-    
-    bot.sendMessage(chatId, helpMessage, { parse_mode: "Markdown" });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                         CALLBACK HANDLERS                                    ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Handle inline keyboard button callbacks
- */
-bot.on("callback_query", async (callbackQuery) => {
-    const chatId = callbackQuery.message.chat.id;
-    const userId = callbackQuery.from.id;
-    const data = callbackQuery.data;
-    const messageId = callbackQuery.message.message_id;
-    
-    // Acknowledge the callback
-    bot.answerCallbackQuery(callbackQuery.id);
-    
-    // Get user state
-    const userState = state.userStates.get(userId);
-    
-    // Handle torrent type selection
-    if (data.startsWith("torrent_")) {
-        if (!userState || userState.step !== "select_type") {
-            bot.editMessageText("❌ Session expired. Please try again.", {
-                chat_id: chatId,
-                message_id: messageId,
-            });
-            return;
-        }
-        
-        if (data === "torrent_cancel") {
-            state.userStates.delete(userId);
-            bot.editMessageText("❌ Download cancelled.", {
-                chat_id: chatId,
-                message_id: messageId,
-            });
-            return;
-        }
-        
-        const type = data === "torrent_movie" ? "movie" : "series";
-        const magnetLink = userState.magnetLink;
-        
-        state.userStates.delete(userId);
-        
-        bot.editMessageText(`⏳ Adding ${type} to download queue...`, {
-            chat_id: chatId,
-            message_id: messageId,
-        });
-        
-        await handleTorrentAdd(chatId, magnetLink, type);
-    }
-    
-    // Handle delete confirmation
-    if (data.startsWith("delete_")) {
-        if (!userState || userState.step !== "confirm_delete") {
-            bot.editMessageText("❌ Session expired. Please try again.", {
-                chat_id: chatId,
-                message_id: messageId,
-            });
-            return;
-        }
-        
-        if (data === "delete_cancel") {
-            state.userStates.delete(userId);
-            bot.editMessageText("❌ Deletion cancelled.", {
-                chat_id: chatId,
-                message_id: messageId,
-            });
-            return;
-        }
-        
-        const deleteFiles = data === "delete_files";
-        
-        try {
-            await deleteTorrent(userState.hash, deleteFiles);
-            state.userStates.delete(userId);
-            
-            const msg = deleteFiles 
-                ? `🔥 Deleted with files: *${userState.name}*`
-                : `🗑️ Deleted: *${userState.name}*`;
-            
-            bot.editMessageText(msg, {
-                chat_id: chatId,
-                message_id: messageId,
-                parse_mode: "Markdown",
-            });
-        } catch (error) {
-            bot.editMessageText(`❌ Error: ${error.message}`, {
-                chat_id: chatId,
-                message_id: messageId,
-            });
-        }
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                           ERROR HANDLING                                     ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Handle polling errors gracefully
- */
-bot.on("polling_error", (error) => {
-    if (error.code === 'ETELEGRAM' && error.message.includes('409')) {
-        console.error("⚠️  Telegram 409 Conflict: Another bot instance is running!");
-        console.error("   💡 Solution: Stop all other instances or use webhooks in production");
-    } else {
-        console.error("Telegram polling error:", error.message);
-    }
-});
-
-/**
- * Handle uncaught errors
- */
-process.on("uncaughtException", (error) => {
-    console.error("Uncaught Exception:", error);
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-    console.error("Unhandled Rejection at:", promise, "reason:", reason);
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ║                              STARTUP                                         ║
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Validate configuration before starting
- */
-function validateConfig() {
-    const errors = [];
-    const warnings = [];
-    
-    // Critical checks
-    if (!CONFIG.telegramToken) {
-        errors.push("❌ TELEGRAM_TOKEN is not configured!");
-    }
-    if (!CONFIG.serverIp) {
-        errors.push("❌ SERVER_IP is not configured!");
-    }
-    if (!CONFIG.plexToken) {
-        warnings.push("⚠️  PLEX_TOKEN is not configured - Plex features will be limited");
-    }
-    if (!CONFIG.telegramChatId) {
-        warnings.push("⚠️  TELEGRAM_CHAT_ID is not configured - automatic alerts disabled");
-    }
-    
-    // qBittorrent host check
-    if (CONFIG.qbittorrent.host === "localhost" && CONFIG.isProduction) {
-        warnings.push("⚠️  qBittorrent host is 'localhost' but SERVER_IP might not be configured");
-        warnings.push("   💡 Set SERVER_IP environment variable to your server's IP address");
-    }
-    
-    // Webhook check for production
-    if (CONFIG.isProduction && !CONFIG.webhookUrl) {
-        warnings.push("⚠️  WEBHOOK_URL not configured - falling back to polling (may cause 409 errors)");
-        warnings.push("   💡 Set WEBHOOK_URL to https://myplexmonitor.onrender.com for production");
-    }
-    
-    // Display results
-    if (errors.length > 0) {
-        console.log("\n🚨 CONFIGURATION ERRORS:");
-        errors.forEach(err => console.log(err));
-        console.log("\n⚠️  Bot may not work correctly!\n");
-    }
-    
-    if (warnings.length > 0) {
-        console.log("\n⚠️  CONFIGURATION WARNINGS:");
-        warnings.forEach(warn => console.log(warn));
-        console.log();
-    }
-    
-    return errors.length === 0;
-}
-
-// Validate configuration
-const configValid = validateConfig();
-
-// Start the automatic monitoring loop
-setInterval(autoCheck, CONFIG.checkInterval);
-
-// Start the download completion checker
-setInterval(checkDownloads, CONFIG.downloadCheckInterval);
-
-// Initial qBittorrent connection attempt
-qbLogin().then((success) => {
-    if (success) {
-        console.log("✅ Connected to qBittorrent");
-    } else {
-        console.log("⚠️  Could not connect to qBittorrent - torrent features will be limited");
-    }
-});
-
-// Test Plex connection
-pingServer((isOnline, reason) => {
-    if (isOnline) {
-        console.log("✅ Plex server is reachable");
-    } else {
-        console.log(`⚠️  Plex server is not reachable: ${reason}`);
-    }
-});
-
-// Startup complete message
-console.log(`
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                         🎬 MyPlexMonitor Started! 🎬                         ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  Mode: ${CONFIG.isProduction ? "PRODUCTION" : "DEVELOPMENT"}                                                   
-║  Server IP: ${CONFIG.serverIp || "NOT SET"}                                            
-║  Plex Port: ${CONFIG.plexPort}                                                  
-║  qBittorrent: ${CONFIG.qbittorrent.host}:${CONFIG.qbittorrent.port}                                      
-║  Check Interval: ${CONFIG.checkInterval / 1000}s                                                  
-║  Web Port: ${CONFIG.webPort}                                                        
-╚══════════════════════════════════════════════════════════════════════════════╝
-`);
+    await autoCheck();
+    setInterval(autoCheck, CONFIG.checkInterval);
+})();
