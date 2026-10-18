@@ -5,6 +5,8 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const os = require("os");
+const fs = require("fs/promises");
+const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
 
@@ -18,6 +20,14 @@ function parseIntEnv(value, fallback) {
     return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+function parseChatIds(rawValue) {
+    if (!rawValue) return [];
+    return rawValue
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+}
+
 const CONFIG = {
     role: (process.env.ROLE || "LOCAL").toUpperCase() === "BACKUP" ? "BACKUP" : "LOCAL",
     plexIp: process.env.PLEX_IP || "127.0.0.1",
@@ -25,6 +35,7 @@ const CONFIG = {
     checkInterval: parseIntEnv(process.env.CHECK_INTERVAL, 30000),
     telegramToken: process.env.TELEGRAM_TOKEN,
     telegramChatId: process.env.TELEGRAM_CHAT_ID,
+    telegramChatIds: parseChatIds(process.env.TELEGRAM_CHAT_ID),
     port: parseIntEnv(process.env.PORT, 3000),
     qbit: {
         host: process.env.QBITTORRENT_HOST || "127.0.0.1",
@@ -59,6 +70,9 @@ const state = {
     awaitingCustomPath: new Set(),
     downloadsView: new Map(),
     qbitSid: null,
+    torrentAliasesByHash: new Map(),
+    torrentHashesByAlias: new Map(),
+    nextTorrentAlias: 1,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +139,59 @@ function createProgressBar(percent, length = 10) {
     return `${"█".repeat(filled)}${"░".repeat(length - filled)}`;
 }
 
+function buildAliasId(index) {
+    return `T${String(index).padStart(3, "0")}`;
+}
+
+function getOrCreateTorrentAlias(hash) {
+    if (state.torrentAliasesByHash.has(hash)) {
+        return state.torrentAliasesByHash.get(hash);
+    }
+    const alias = buildAliasId(state.nextTorrentAlias);
+    state.nextTorrentAlias += 1;
+    state.torrentAliasesByHash.set(hash, alias);
+    state.torrentHashesByAlias.set(alias.toLowerCase(), hash);
+    return alias;
+}
+
+function simplifyTorrentName(name) {
+    if (!name) return "Sans nom";
+    const cleaned = name
+        .replace(/[._]+/g, " ")
+        .replace(/\[[^\]]+\]/g, " ")
+        .replace(/\([^)]*(1080p|2160p|720p|x264|x265|h\.?264|h\.?265|bluray|webrip|web-dl|dvdrip)[^)]*\)/gi, " ")
+        .replace(/\b(1080p|2160p|720p|x264|x265|h\.?264|h\.?265|bluray|webrip|web-dl|dvdrip|proper|repack|multi|french|vostfr)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    return cleaned || name;
+}
+
+function formatTorrentDisplayName(torrent) {
+    const alias = getOrCreateTorrentAlias(torrent.hash);
+    return `[${alias}] ${simplifyTorrentName(torrent.name)}`;
+}
+
+function isPausedState(qbitState) {
+    return ["pausedDL", "pausedUP"].includes(qbitState);
+}
+
+function isChatAuthorized(chatId) {
+    if (CONFIG.telegramChatIds.length === 0) return true;
+    return CONFIG.telegramChatIds.includes(String(chatId));
+}
+
+async function denyUnauthorized(chatId) {
+    await safeSendMessage(chatId, "❌ Accès refusé: chat non autorisé.");
+}
+
+async function withAuthorizedChat(chatId, handler) {
+    if (!isChatAuthorized(chatId)) {
+        await denyUnauthorized(chatId);
+        return;
+    }
+    await handler();
+}
+
 async function safeSendMessage(chatId, text, options = {}) {
     try {
         await bot.sendMessage(chatId, text, options);
@@ -134,11 +201,12 @@ async function safeSendMessage(chatId, text, options = {}) {
 }
 
 async function sendAlert(text, options = {}) {
-    if (!CONFIG.telegramChatId) {
+    const recipients = CONFIG.telegramChatIds.length > 0 ? CONFIG.telegramChatIds : [CONFIG.telegramChatId].filter(Boolean);
+    if (recipients.length === 0) {
         logInfo("⚠️ TELEGRAM_CHAT_ID absent: alerte ignorée.");
         return;
     }
-    await safeSendMessage(CONFIG.telegramChatId, text, options);
+    await Promise.all(recipients.map((chatId) => safeSendMessage(chatId, text, options)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,7 +532,7 @@ async function resumeAllTorrents() {
 
 async function pauseTorrentByName(name) {
     const torrents = await listTorrents("all");
-    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    const torrent = resolveTorrentTarget(torrents, name);
     if (!torrent) throw new Error("Torrent introuvable");
     await qbitRequest("/torrents/pause", "POST", { hashes: torrent.hash });
     return torrent.name;
@@ -472,7 +540,7 @@ async function pauseTorrentByName(name) {
 
 async function resumeTorrentByName(name) {
     const torrents = await listTorrents("all");
-    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    const torrent = resolveTorrentTarget(torrents, name);
     if (!torrent) throw new Error("Torrent introuvable");
     await qbitRequest("/torrents/resume", "POST", { hashes: torrent.hash });
     return torrent.name;
@@ -480,7 +548,7 @@ async function resumeTorrentByName(name) {
 
 async function deleteTorrentByName(name) {
     const torrents = await listTorrents("all");
-    const torrent = torrents.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+    const torrent = resolveTorrentTarget(torrents, name);
     if (!torrent) throw new Error("Torrent introuvable");
     await qbitRequest("/torrents/delete", "POST", { hashes: torrent.hash, deleteFiles: "false" });
     return torrent.name;
@@ -492,6 +560,160 @@ async function deleteCompletedTorrents() {
     const hashes = completed.map((torrent) => torrent.hash).join("|");
     await qbitRequest("/torrents/delete", "POST", { hashes, deleteFiles: "false" });
     return completed.length;
+}
+
+function selectTorrentsForAction(torrents, action) {
+    if (action === "pause") return torrents.filter((torrent) => !isPausedState(torrent.state));
+    if (action === "resume") return torrents.filter((torrent) => isPausedState(torrent.state));
+    return torrents;
+}
+
+function getActionTitle(action) {
+    if (action === "pause") return "⏸️ Torrents pouvant être mis en pause";
+    if (action === "resume") return "▶️ Torrents pouvant être repris";
+    return "🗑️ Torrents pouvant être supprimés";
+}
+
+function getActionVerb(action) {
+    if (action === "pause") return "mis en pause";
+    if (action === "resume") return "repris";
+    return "supprimé";
+}
+
+function buildActionCallback(action, hash) {
+    return `ta:${action}:${hash}`;
+}
+
+function resolveTorrentTarget(torrents, rawInput) {
+    const input = (rawInput || "").trim();
+    if (!input) return null;
+
+    const normalized = input.toLowerCase();
+    const hashFromAlias = state.torrentHashesByAlias.get(normalized);
+    if (hashFromAlias) {
+        return torrents.find((torrent) => torrent.hash === hashFromAlias) || null;
+    }
+
+    const exactHash = torrents.find((torrent) => torrent.hash.toLowerCase() === normalized);
+    if (exactHash) return exactHash;
+
+    const exactAlias = torrents.find((torrent) => getOrCreateTorrentAlias(torrent.hash).toLowerCase() === normalized);
+    if (exactAlias) return exactAlias;
+
+    const partial = torrents.find((torrent) => torrent.name.toLowerCase().includes(normalized));
+    return partial || null;
+}
+
+async function renderTorrentActionPicker(chatId, action) {
+    const torrents = await listTorrents("all");
+    const candidates = selectTorrentsForAction(torrents, action);
+    if (candidates.length === 0) {
+        await safeSendMessage(chatId, "ℹ️ Aucun torrent disponible pour cette action.");
+        return;
+    }
+
+    const maxItems = 20;
+    const items = candidates.slice(0, maxItems);
+    const lines = [
+        getActionTitle(action),
+        "",
+        ...items.map((torrent) => `• ${formatTorrentDisplayName(torrent)}`),
+    ];
+
+    if (candidates.length > maxItems) {
+        lines.push("", `… ${candidates.length - maxItems} autres torrents non affichés.`);
+    }
+
+    const keyboardRows = items.map((torrent) => [
+        {
+            text: `${action === "delete" ? "🗑️" : action === "pause" ? "⏸️" : "▶️"} ${getOrCreateTorrentAlias(torrent.hash)}`,
+            callback_data: buildActionCallback(action, torrent.hash),
+        },
+    ]);
+
+    if (action === "pause") {
+        keyboardRows.push([{ text: "⏸️ Tout mettre en pause", callback_data: "dl:batch:pause" }]);
+    }
+    if (action === "resume") {
+        keyboardRows.push([{ text: "▶️ Tout reprendre", callback_data: "dl:batch:resume" }]);
+    }
+
+    await safeSendMessage(chatId, lines.join("\n"), {
+        reply_markup: {
+            inline_keyboard: keyboardRows,
+        },
+    });
+}
+
+async function applyTorrentAction(action, hash) {
+    const torrents = await listTorrents("all");
+    const torrent = torrents.find((item) => item.hash === hash);
+    if (!torrent) {
+        throw new Error("Torrent introuvable");
+    }
+
+    if (action === "pause") {
+        await qbitRequest("/torrents/pause", "POST", { hashes: hash });
+    } else if (action === "resume") {
+        await qbitRequest("/torrents/resume", "POST", { hashes: hash });
+    } else {
+        await qbitRequest("/torrents/delete", "POST", { hashes: hash, deleteFiles: "false" });
+    }
+
+    return torrent;
+}
+
+async function buildMoviesCatalog(rootPath, options = {}) {
+    const maxResults = options.maxResults || 200;
+    const maxDepth = options.maxDepth || 3;
+    const videos = [];
+    const queue = [{ currentPath: rootPath, depth: 0 }];
+    const allowedExtensions = new Set([".mkv", ".mp4", ".avi", ".mov", ".m4v"]);
+
+    while (queue.length > 0 && videos.length < maxResults) {
+        const { currentPath, depth } = queue.shift();
+        let entries = [];
+        try {
+            entries = await fs.readdir(currentPath, { withFileTypes: true });
+        } catch (error) {
+            continue;
+        }
+
+        for (const entry of entries) {
+            if (videos.length >= maxResults) break;
+            const fullPath = path.join(currentPath, entry.name);
+
+            if (entry.isDirectory() && depth < maxDepth) {
+                queue.push({ currentPath: fullPath, depth: depth + 1 });
+                continue;
+            }
+
+            if (!entry.isFile()) continue;
+            const extension = path.extname(entry.name).toLowerCase();
+            if (!allowedExtensions.has(extension)) continue;
+
+            let stat = null;
+            try {
+                stat = await fs.stat(fullPath);
+            } catch (error) {
+                continue;
+            }
+
+            videos.push({
+                fileName: entry.name,
+                simpleName: simplifyTorrentName(entry.name.replace(extension, "")),
+                updatedAt: stat.mtimeMs || 0,
+            });
+        }
+    }
+
+    return videos;
+}
+
+function toCsvLine(values) {
+    return values
+        .map((value) => `"${String(value ?? "").replace(/"/g, "\"\"")}"`)
+        .join(",");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -632,7 +854,7 @@ async function renderDownloads(chatId, filter = "all", page = 0, editMeta = null
 
     state.downloadsView.set(chatId, { filter, page: safePage });
 
-    let message = `📥 *Téléchargements* (${filter})\nPage ${safePage + 1}/${totalPages}\n\n`;
+    let message = `📥 *Téléchargements* (${filter})\nPage ${safePage + 1}/${totalPages}\n💡 Utilise les IDs \\[Txxx\\] avec /pause /resume /delete\n\n`;
 
     if (pageItems.length === 0) {
         message += "Aucun torrent pour ce filtre.";
@@ -642,7 +864,7 @@ async function renderDownloads(chatId, filter = "all", page = 0, editMeta = null
         const percent = Math.round((torrent.progress || 0) * 100);
         const eta = torrent.eta > 0 ? formatDuration(torrent.eta) : "n/a";
         message += [
-            `*${torrent.name.replace(/\*/g, "")}*`,
+            `*${formatTorrentDisplayName(torrent).replace(/\*/g, "")}*`,
             `${getTorrentStatusLabel(torrent.state)} ${createProgressBar(percent)} ${percent}%`,
             `⬇️ ${formatBytes(torrent.dlspeed || 0)}/s | ⬆️ ${formatBytes(torrent.upspeed || 0)}/s | ETA ${eta}`,
             "",
@@ -687,202 +909,307 @@ async function renderDownloads(chatId, filter = "all", page = 0, editMeta = null
 // ─────────────────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
-    await safeSendMessage(
-        chatId,
-        `👋 *MyPlexMonitor prêt*\n\nRôle actif: *${CONFIG.role}*\n\nUtilise /help pour voir toutes les commandes.`,
-        { parse_mode: "Markdown" }
-    );
+    await withAuthorizedChat(chatId, async () => {
+        await safeSendMessage(
+            chatId,
+            `👋 *MyPlexMonitor prêt*\n\nRôle actif: *${CONFIG.role}*\n\nUtilise /help pour voir toutes les commandes.`,
+            { parse_mode: "Markdown" }
+        );
+    });
 });
 
 bot.onText(/\/help/, async (msg) => {
     const chatId = msg.chat.id;
-    const text = [
-        `📚 *Commandes disponibles* (rôle: ${CONFIG.role})`,
-        "",
-        "📡 Monitoring",
-        "- /check",
-        "- /restart_plex",
-        "",
-        "📥 Torrents",
-        "- /torrent <magnet|url>",
-        "- /movie <magnet|url>",
-        "- /series <magnet|url>",
-        "- /downloads [all|active|paused|completed]",
-        "- /pause [nom]",
-        "- /resume [nom]",
-        "- /delete <nom>",
-        "",
-        "💡 Le mode BACKUP n'écoute Telegram que pendant une panne Ubuntu.",
-    ].join("\n");
-    await safeSendMessage(chatId, text, { parse_mode: "Markdown" });
+    await withAuthorizedChat(chatId, async () => {
+        const text = [
+            `📚 *Commandes disponibles* (rôle: ${CONFIG.role})`,
+            "",
+            "📡 Monitoring",
+            "- /check",
+            "- /restart_plex",
+            "",
+            "📥 Torrents",
+            "- /torrent <magnet|url>",
+            "- /movie <magnet|url>",
+            "- /series <magnet|url>",
+            "- /downloads [all|active|paused|completed]",
+            "- /pause [id|nom] (sans argument: bouton de sélection)",
+            "- /resume [id|nom] (sans argument: bouton de sélection)",
+            "- /delete [id|nom] (sans argument: bouton de sélection)",
+            "- /export_torrents",
+            "",
+            "🎬 Médias",
+            "- /random",
+            "- /movies [az|za|recent]",
+            "",
+            "💡 Le mode BACKUP n'écoute Telegram que pendant une panne Ubuntu.",
+        ].join("\n");
+        await safeSendMessage(chatId, text, { parse_mode: "Markdown" });
+    });
 });
 
 bot.onText(/\/check/, async (msg) => {
     const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+        try {
+            const result = await pingServer();
+            const statusLine = result.online ? "🟢 ONLINE" : "🔴 OFFLINE";
 
-    try {
-        const result = await pingServer();
-        const statusLine = result.online ? "🟢 ONLINE" : "🔴 OFFLINE";
+            if (CONFIG.role === "LOCAL") {
+                const diagnostics = await getUbuntuDiagnostics();
+                await safeSendMessage(
+                    chatId,
+                    `🔎 *Vérification immédiate*\nStatut Plex: ${statusLine}\nCause technique: ${result.reason}\n🕒 ${getFormattedDate()}\n\n${diagnostics}`,
+                    { parse_mode: "Markdown" }
+                );
+                return;
+            }
 
-        if (CONFIG.role === "LOCAL") {
-            const diagnostics = await getUbuntuDiagnostics();
             await safeSendMessage(
                 chatId,
-                `🔎 *Vérification immédiate*\nStatut Plex: ${statusLine}\nCause technique: ${result.reason}\n🕒 ${getFormattedDate()}\n\n${diagnostics}`,
+                [
+                    "🔎 *Vérification BACKUP*",
+                    `Statut distant Plex: ${statusLine}`,
+                    `Cause technique: ${result.reason}`,
+                    `Dernière panne mémorisée: ${state.lastDownTime || "inconnue"}`,
+                    `Raison mémorisée: ${state.lastDownReason || "non déterminée"}`,
+                    `Horodatage: ${getFormattedDate()}`,
+                ].join("\n"),
                 { parse_mode: "Markdown" }
             );
-            return;
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ Erreur pendant /check: ${error.message}`);
         }
-
-        await safeSendMessage(
-            chatId,
-            [
-                "🔎 *Vérification BACKUP*",
-                `Statut distant Plex: ${statusLine}`,
-                `Cause technique: ${result.reason}`,
-                `Dernière panne mémorisée: ${state.lastDownTime || "inconnue"}`,
-                `Raison mémorisée: ${state.lastDownReason || "non déterminée"}`,
-                `Horodatage: ${getFormattedDate()}`,
-            ].join("\n"),
-            { parse_mode: "Markdown" }
-        );
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ Erreur pendant /check: ${error.message}`);
-    }
+    });
 });
 
 bot.onText(/\/restart_plex/, async (msg) => {
     const chatId = msg.chat.id;
-
-    if (CONFIG.role === "BACKUP") {
-        await safeSendMessage(
-            chatId,
-            "❌ Impossible: redémarrage logiciel indisponible car le serveur Ubuntu physique est hors ligne."
-        );
-        return;
-    }
-
-    try {
-        await safeSendMessage(chatId, "♻️ Redémarrage de plexmediaserver en cours...");
-        await execAsync("sudo systemctl restart plexmediaserver", { timeout: 20000 });
-        await safeSendMessage(chatId, "✅ Commande systemctl exécutée. Vérification dans 5 secondes...");
-
-        setTimeout(async () => {
-            const result = await pingServer();
+    await withAuthorizedChat(chatId, async () => {
+        if (CONFIG.role === "BACKUP") {
             await safeSendMessage(
                 chatId,
-                result.online
-                    ? `✅ Plex répond à nouveau après redémarrage. (${getFormattedDate()})`
-                    : `⚠️ Plex ne répond toujours pas: ${result.reason} (${getFormattedDate()})`
+                "❌ Impossible: redémarrage logiciel indisponible car le serveur Ubuntu physique est hors ligne."
             );
-        }, 5000);
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ Échec du redémarrage: ${error.message}`);
-    }
+            return;
+        }
+
+        try {
+            await safeSendMessage(chatId, "♻️ Redémarrage de plexmediaserver en cours...");
+            await execAsync("sudo systemctl restart plexmediaserver", { timeout: 20000 });
+            await safeSendMessage(chatId, "✅ Commande systemctl exécutée. Vérification dans 5 secondes...");
+
+            setTimeout(async () => {
+                const result = await pingServer();
+                await safeSendMessage(
+                    chatId,
+                    result.online
+                        ? `✅ Plex répond à nouveau après redémarrage. (${getFormattedDate()})`
+                        : `⚠️ Plex ne répond toujours pas: ${result.reason} (${getFormattedDate()})`
+                );
+            }, 5000);
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ Échec du redémarrage: ${error.message}`);
+        }
+    });
 });
 
 bot.onText(/\/torrent(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const source = (match?.[1] || "").trim();
+    await withAuthorizedChat(chatId, async () => {
+        const source = (match?.[1] || "").trim();
 
-    if (!source) {
-        await safeSendMessage(chatId, "Usage: /torrent <magnet|url>");
-        return;
-    }
+        if (!source) {
+            await safeSendMessage(chatId, "Usage: /torrent <magnet|url>");
+            return;
+        }
 
-    initializeTorrentSession(chatId, source, "movie");
-    await askMediaType(chatId);
+        initializeTorrentSession(chatId, source, "movie");
+        await askMediaType(chatId);
+    });
 });
 
 bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const source = (match?.[1] || "").trim();
-    if (!source) {
-        await safeSendMessage(chatId, "Usage: /movie <magnet|url>");
-        return;
-    }
-    initializeTorrentSession(chatId, source, "movie");
-    await askSavePath(chatId);
+    await withAuthorizedChat(chatId, async () => {
+        const source = (match?.[1] || "").trim();
+        if (!source) {
+            await safeSendMessage(chatId, "Usage: /movie <magnet|url>");
+            return;
+        }
+        initializeTorrentSession(chatId, source, "movie");
+        await askSavePath(chatId);
+    });
 });
 
 bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const source = (match?.[1] || "").trim();
-    if (!source) {
-        await safeSendMessage(chatId, "Usage: /series <magnet|url>");
-        return;
-    }
-    initializeTorrentSession(chatId, source, "series");
-    await askSavePath(chatId);
+    await withAuthorizedChat(chatId, async () => {
+        const source = (match?.[1] || "").trim();
+        if (!source) {
+            await safeSendMessage(chatId, "Usage: /series <magnet|url>");
+            return;
+        }
+        initializeTorrentSession(chatId, source, "series");
+        await askSavePath(chatId);
+    });
 });
 
 bot.onText(/\/downloads?(?:\s+(\S+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const filter = parseFilterArg(match?.[1]);
+    await withAuthorizedChat(chatId, async () => {
+        const filter = parseFilterArg(match?.[1]);
 
-    try {
-        await renderDownloads(chatId, filter, 0);
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ Impossible de charger les torrents: ${error.message}`);
-    }
+        try {
+            await renderDownloads(chatId, filter, 0);
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ Impossible de charger les torrents: ${error.message}`);
+        }
+    });
 });
 
 bot.onText(/\/pause(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const name = (match?.[1] || "").trim();
+    await withAuthorizedChat(chatId, async () => {
+        const name = (match?.[1] || "").trim();
 
-    try {
-        if (!name) {
-            await pauseAllTorrents();
-            await safeSendMessage(chatId, "⏸️ Tous les torrents sont en pause.");
-            return;
+        try {
+            if (!name) {
+                await renderTorrentActionPicker(chatId, "pause");
+                return;
+            }
+
+            const pausedName = await pauseTorrentByName(name);
+            await safeSendMessage(chatId, `⏸️ Torrent en pause: ${simplifyTorrentName(pausedName)}`);
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /pause: ${error.message}`);
         }
-
-        const pausedName = await pauseTorrentByName(name);
-        await safeSendMessage(chatId, `⏸️ Torrent en pause: ${pausedName}`);
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ /pause: ${error.message}`);
-    }
+    });
 });
 
 bot.onText(/\/resume(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const name = (match?.[1] || "").trim();
+    await withAuthorizedChat(chatId, async () => {
+        const name = (match?.[1] || "").trim();
 
-    try {
-        if (!name) {
-            await resumeAllTorrents();
-            await safeSendMessage(chatId, "▶️ Tous les torrents reprennent.");
-            return;
+        try {
+            if (!name) {
+                await renderTorrentActionPicker(chatId, "resume");
+                return;
+            }
+
+            const resumedName = await resumeTorrentByName(name);
+            await safeSendMessage(chatId, `▶️ Torrent repris: ${simplifyTorrentName(resumedName)}`);
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /resume: ${error.message}`);
         }
-
-        const resumedName = await resumeTorrentByName(name);
-        await safeSendMessage(chatId, `▶️ Torrent repris: ${resumedName}`);
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ /resume: ${error.message}`);
-    }
+    });
 });
 
 bot.onText(/\/delete(?:\s+(.+))?/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const name = (match?.[1] || "").trim();
+    await withAuthorizedChat(chatId, async () => {
+        const name = (match?.[1] || "").trim();
 
-    if (!name) {
-        await safeSendMessage(chatId, "Usage: /delete <nom_du_torrent>");
-        return;
-    }
+        if (!name) {
+            await renderTorrentActionPicker(chatId, "delete");
+            return;
+        }
 
-    try {
-        const deletedName = await deleteTorrentByName(name);
-        await safeSendMessage(chatId, `🗑️ Torrent supprimé (fichiers conservés): ${deletedName}`);
-    } catch (error) {
-        await safeSendMessage(chatId, `❌ /delete: ${error.message}`);
-    }
+        try {
+            const deletedName = await deleteTorrentByName(name);
+            await safeSendMessage(chatId, `🗑️ Torrent supprimé (fichiers conservés): ${simplifyTorrentName(deletedName)}`);
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /delete: ${error.message}`);
+        }
+    });
+});
+
+bot.onText(/\/random/i, async (msg) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+        try {
+            const movies = await buildMoviesCatalog(CONFIG.qbit.pathMovie, { maxResults: 400, maxDepth: 4 });
+            if (movies.length === 0) {
+                await safeSendMessage(chatId, "ℹ️ Aucun film trouvé dans le dossier MOVIES_PATH.");
+                return;
+            }
+            const selected = movies[Math.floor(Math.random() * movies.length)];
+            await safeSendMessage(chatId, `🎲 Film du soir: *${selected.simpleName}*`, { parse_mode: "Markdown" });
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /random: ${error.message}`);
+        }
+    });
+});
+
+bot.onText(/\/movies(?:\s+(\S+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+        const mode = (match?.[1] || "az").toLowerCase();
+        try {
+            const movies = await buildMoviesCatalog(CONFIG.qbit.pathMovie, { maxResults: 500, maxDepth: 4 });
+            if (movies.length === 0) {
+                await safeSendMessage(chatId, "ℹ️ Aucun film trouvé dans le dossier MOVIES_PATH.");
+                return;
+            }
+
+            if (mode === "recent") {
+                movies.sort((a, b) => b.updatedAt - a.updatedAt);
+            } else if (mode === "za") {
+                movies.sort((a, b) => b.simpleName.localeCompare(a.simpleName, "fr"));
+            } else {
+                movies.sort((a, b) => a.simpleName.localeCompare(b.simpleName, "fr"));
+            }
+
+            const preview = movies.slice(0, 30);
+            const lines = [
+                `🎬 Liste films (${mode})`,
+                ...preview.map((movie, index) => `${index + 1}. ${movie.simpleName}`),
+            ];
+
+            if (movies.length > preview.length) {
+                lines.push(`… ${movies.length - preview.length} film(s) supplémentaire(s).`);
+            }
+
+            await safeSendMessage(chatId, lines.join("\n"));
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /movies: ${error.message}`);
+        }
+    });
+});
+
+bot.onText(/\/export_torrents/i, async (msg) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+        try {
+            const torrents = await listTorrents("all");
+            const csvRows = [
+                toCsvLine(["alias", "name", "status", "progress_percent", "size_bytes", "dl_speed", "up_speed"]),
+                ...torrents.map((torrent) => toCsvLine([
+                    getOrCreateTorrentAlias(torrent.hash),
+                    simplifyTorrentName(torrent.name),
+                    torrent.state || "",
+                    Math.round((torrent.progress || 0) * 100),
+                    torrent.size || 0,
+                    torrent.dlspeed || 0,
+                    torrent.upspeed || 0,
+                ])),
+            ];
+
+            await bot.sendDocument(chatId, Buffer.from(`${csvRows.join("\n")}\n`, "utf8"), {
+                filename: `torrents-${Date.now()}.csv`,
+                contentType: "text/csv",
+            });
+        } catch (error) {
+            await safeSendMessage(chatId, `❌ /export_torrents: ${error.message}`);
+        }
+    });
 });
 
 bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
     if (!msg.text || msg.text.startsWith("/")) return;
+    if (!isChatAuthorized(chatId)) return;
 
     if (!state.awaitingCustomPath.has(chatId)) return;
 
@@ -903,6 +1230,7 @@ bot.on("callback_query", async (query) => {
     const data = query.data;
 
     if (!chatId || !data) return;
+    if (!isChatAuthorized(chatId)) return;
 
     await bot.answerCallbackQuery(query.id).catch(() => null);
 
@@ -1035,6 +1363,14 @@ bot.on("callback_query", async (query) => {
                 await safeSendMessage(chatId, `🗑️ ${deletedCount} torrent(s) terminés supprimé(s).`);
                 return;
             }
+        }
+
+        if (data.startsWith("ta:")) {
+            const [, action, hash] = data.split(":");
+            if (!action || !hash) return;
+            const torrent = await applyTorrentAction(action, hash);
+            await safeSendMessage(chatId, `✅ Torrent ${getActionVerb(action)}: ${formatTorrentDisplayName(torrent)}`);
+            return;
         }
     } catch (error) {
         await safeSendMessage(chatId, `❌ Erreur action bouton: ${error.message}`);
