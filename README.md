@@ -28,7 +28,12 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
   - démarrage immédiat ou en pause
   - confirmation + actions rapides
 - `/downloads [all|active|paused|completed]`
-- `/pause [nom]`, `/resume [nom]`, `/delete <nom>`
+- `/pause [id|nom]`, `/resume [id|nom]`, `/delete [id|nom]`
+- Sans argument sur `/pause`, `/resume`, `/delete`: affichage des torrents actionnables avec boutons Telegram
+- Alias lisibles `[T001]`, `[T002]`... utilisables directement dans les commandes
+- `/random` (film aléatoire depuis `MOVIES_PATH`)
+- `/movies [az|za|recent]` (liste triée)
+- `/export_torrents` (export CSV des torrents)
 
 ### Diagnostic Ubuntu (LOCAL)
 - Rapport de démarrage (uptime, loadavg, RAM, analyse `last -x`).
@@ -99,6 +104,71 @@ myuser ALL=NOPASSWD: /bin/systemctl restart plexmediaserver
 ```
 
 > Important: garde la commande exacte pour limiter les droits.
+
+---
+
+## Déploiement Docker sur Ubuntu (mise à jour simple)
+
+### 1) Préparer les fichiers
+
+Crée un fichier `.env` à partir de `.env.example`, puis ajuste les variables.
+
+### 2) Construire et lancer
+
+```bash
+docker build -t myplexmonitor:latest .
+docker run -d --name myplexmonitor \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 3000:3000 \
+  -v /mnt/films:/mnt/films \
+  myplexmonitor:latest
+```
+
+### 3) Vérifier
+
+```bash
+docker logs -f myplexmonitor
+curl http://127.0.0.1:3000/
+```
+
+### 4) Procédure de mise à jour (à donner à une autre IA)
+
+```bash
+cd /path/to/myPlexMonitor
+git fetch --all
+git pull --ff-only
+docker build -t myplexmonitor:latest .
+docker stop myplexmonitor || true
+docker rm myplexmonitor || true
+docker run -d --name myplexmonitor \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 3000:3000 \
+  -v /mnt/films:/mnt/films \
+  myplexmonitor:latest
+curl http://127.0.0.1:3000/
+```
+
+### 5) Rollback rapide
+
+Taggue toujours l’image précédente avant update:
+
+```bash
+docker tag myplexmonitor:latest myplexmonitor:backup
+```
+
+Puis en cas de problème:
+
+```bash
+docker stop myplexmonitor && docker rm myplexmonitor
+docker run -d --name myplexmonitor \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 3000:3000 \
+  -v /mnt/films:/mnt/films \
+  myplexmonitor:backup
+```
 
 ---
 
