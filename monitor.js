@@ -36,6 +36,7 @@ const CONFIG = {
   plexIp: process.env.PLEX_IP || "127.0.0.1",
   plexPort: parseIntEnv(process.env.PLEX_PORT, 32400),
   checkInterval: parseIntEnv(process.env.CHECK_INTERVAL, 30000),
+  isContainer: process.env.CONTAINERIZED === "1",
   telegramToken: process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
   telegramChatIds: parseChatIds(process.env.TELEGRAM_CHAT_ID),
@@ -44,7 +45,7 @@ const CONFIG = {
     host: process.env.QBITTORRENT_HOST || "127.0.0.1",
     port: parseIntEnv(process.env.QBITTORRENT_PORT, 8080),
     username: process.env.QBITTORRENT_USERNAME || "admin",
-    password: process.env.QBITTORRENT_PASSWORD || "adminadmin",
+    password: process.env.QBITTORRENT_PASSWORD || "",
     categoryMovie: process.env.QBITTORRENT_CATEGORY_MOVIE || "movies",
     categorySeries: process.env.QBITTORRENT_CATEGORY_SERIES || "series",
     categoryOther: process.env.QBITTORRENT_CATEGORY_OTHER || "other",
@@ -1097,6 +1098,14 @@ bot.onText(/\/check/, async (msg) => {
 bot.onText(/\/restart_plex/, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
+    if (CONFIG.isContainer) {
+      await safeSendMessage(
+        chatId,
+        "❌ /restart_plex n'est pas disponible avec Docker Compose. Redémarre Plex directement sur l'hôte Ubuntu.",
+      );
+      return;
+    }
+
     if (CONFIG.role === "BACKUP") {
       await safeSendMessage(
         chatId,

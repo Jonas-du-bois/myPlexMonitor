@@ -107,68 +107,35 @@ myuser ALL=NOPASSWD: /bin/systemctl restart plexmediaserver
 
 ---
 
-## Déploiement Docker sur Ubuntu (mise à jour simple)
+## Déploiement Docker Compose sur Ubuntu
 
-### 1) Préparer les fichiers
+Le conteneur utilise le réseau hôte Linux pour joindre Plex et qBittorrent via
+`127.0.0.1`. Les dossiers montés sont configurés par `MOVIES_PATH`,
+`SERIES_PATH` et `OTHER_PATH` dans `.env`.
 
-Crée un fichier `.env` à partir de `.env.example`, puis ajuste les variables.
-
-### 2) Construire et lancer
+1. Crée `.env` depuis `.env.example` et renseigne les identifiants et chemins
+   propres au serveur. Ne committe pas `.env` ni `myPlexMonitor.env`.
+2. Construis et démarre le service :
 
 ```bash
-docker build -t myplexmonitor:latest .
-docker run -d --name myplexmonitor \
-  --restart unless-stopped \
-  --env-file .env \
-  -p 3000:3000 \
-  -v /mnt/films:/mnt/films \
-  myplexmonitor:latest
+docker compose up -d --build
 ```
 
-### 3) Vérifier
+3. Vérifie son état, son endpoint de santé et ses journaux :
 
 ```bash
-docker logs -f myplexmonitor
+docker compose ps
 curl http://127.0.0.1:3000/
+docker compose logs -f myplexmonitor
 ```
 
-### 4) Procédure de mise à jour (à donner à une autre IA)
+Pour mettre à jour après un `git pull --ff-only` sur `main`, relance
+`docker compose up -d --build`. Pour arrêter le service, lance
+`docker compose down`.
 
-```bash
-cd /path/to/myPlexMonitor
-git fetch --all
-git pull --ff-only
-docker build -t myplexmonitor:latest .
-docker stop myplexmonitor || true
-docker rm myplexmonitor || true
-docker run -d --name myplexmonitor \
-  --restart unless-stopped \
-  --env-file .env \
-  -p 3000:3000 \
-  -v /mnt/films:/mnt/films \
-  myplexmonitor:latest
-curl http://127.0.0.1:3000/
-```
-
-### 5) Rollback rapide
-
-Taggue toujours l’image précédente avant update:
-
-```bash
-docker tag myplexmonitor:latest myplexmonitor:backup
-```
-
-Puis en cas de problème:
-
-```bash
-docker stop myplexmonitor && docker rm myplexmonitor
-docker run -d --name myplexmonitor \
-  --restart unless-stopped \
-  --env-file .env \
-  -p 3000:3000 \
-  -v /mnt/films:/mnt/films \
-  myplexmonitor:backup
-```
+La commande Telegram `/restart_plex` ne redémarre pas l'hôte depuis Docker
+Compose. Elle indique de redémarrer Plex directement sur Ubuntu. Elle reste
+disponible quand le bot fonctionne directement sur l'hôte avec PM2.
 
 ---
 

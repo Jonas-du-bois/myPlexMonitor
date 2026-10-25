@@ -23,7 +23,7 @@
   "scripts": {
     "start": "node monitor.js",
     "dev": "node --watch monitor.js",
-    "test": "node test-config.js",
+    "test": "node test-smoke.js",
     "test-config": "node test-config.js"
   },
   "engines": {

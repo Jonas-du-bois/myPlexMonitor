@@ -1,0 +1,18 @@
+services:
+  myplexmonitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: myplexmonitor
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      CONTAINERIZED: "1"
+      PORT: ${PORT:-3000}
+    volumes:
+      - "${MOVIES_PATH:-/mnt/films}:${MOVIES_PATH:-/mnt/films}"
+      - "${SERIES_PATH:-/mnt/films/series}:${SERIES_PATH:-/mnt/films/series}"
+      - "${OTHER_PATH:-/mnt/films/downloads}:${OTHER_PATH:-/mnt/films/downloads}"

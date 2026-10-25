@@ -1,7 +1,8 @@
 require("dotenv").config();
 const net = require("net");
 
-const role = (process.env.ROLE || "LOCAL").toUpperCase() === "BACKUP" ? "BACKUP" : "LOCAL";
+const role =
+  (process.env.ROLE || "LOCAL").toUpperCase() === "BACKUP" ? "BACKUP" : "LOCAL";
 const plexIp = process.env.PLEX_IP || "127.0.0.1";
 const plexPort = Number.parseInt(process.env.PLEX_PORT || "32400", 10);
 
@@ -24,8 +25,8 @@ function check(name, value, required = true) {
 }
 
 check("ROLE", role);
-check("TELEGRAM_TOKEN", telegramToken);
-check("TELEGRAM_CHAT_ID", telegramChatId);
+check("TELEGRAM_TOKEN", telegramToken ? "configuré" : undefined);
+check("TELEGRAM_CHAT_ID", telegramChatId ? "configuré" : undefined);
 check("PLEX_IP", plexIp, role === "BACKUP");
 check("PLEX_PORT", plexPort);
 
