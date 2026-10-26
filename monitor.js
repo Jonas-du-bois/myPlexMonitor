@@ -977,6 +977,8 @@ async function renderDownloads(
     ].join("\n");
   }
 
+  message += `\n🕒 Actualisé à : ${getFormattedDate()}`;
+
   const keyboard = {
     inline_keyboard: [
       [
@@ -1693,6 +1695,9 @@ bot.on("callback_query", async (query) => {
       return;
     }
   } catch (error) {
+    if (error.message && error.message.includes("message is not modified")) {
+      return;
+    }
     await safeSendMessage(chatId, `❌ Erreur action bouton: ${error.message}`);
   }
 });
