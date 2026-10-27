@@ -1275,7 +1275,7 @@ bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
       return;
     }
     initializeTorrentSession(chatId, source, "movie");
-    await askSavePath(chatId);
+    await askPriority(chatId);
   });
 });
 
@@ -1288,7 +1288,7 @@ bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
       return;
     }
     initializeTorrentSession(chatId, source, "series");
-    await askSavePath(chatId);
+    await askPriority(chatId);
   });
 });
 
@@ -1616,7 +1616,7 @@ bot.on("callback_query", async (query) => {
       if (data.startsWith("tw:type:")) {
         const mediaType = data.split(":")[2];
         initializeTorrentSession(chatId, session.source, mediaType);
-        await askSavePath(chatId);
+        await askPriority(chatId);
         return;
       }
 
