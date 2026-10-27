@@ -4,6 +4,8 @@ const net = require("net");
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const { GoogleGenAI } = require("@google/genai");
+const FormData = require("form-data");
 const os = require("os");
 const fs = require("fs/promises");
 const path = require("path");
@@ -11,6 +13,53 @@ const { exec } = require("child_process");
 const { promisify } = require("util");
 
 const execAsync = promisify(exec);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Formatage Plex via Gemini (IA)
+// ─────────────────────────────────────────────────────────────────────────────
+async function formatPlexNameWithGemini(rawName, mediaType) {
+  if (!CONFIG.geminiApiKey) {
+    logInfo("⚠️ GEMINI_API_KEY non configurée, fallback sur simplifyTorrentName");
+    return simplifyTorrentName(rawName);
+  }
+
+  try {
+    const ai = new GoogleGenAI({ apiKey: CONFIG.geminiApiKey });
+    const prompt = `
+Tu es un assistant expert pour renommer des fichiers multimédias selon les conventions de Plex.
+Tu dois analyser ce nom de fichier brut et le nettoyer pour qu'il soit parfaitement reconnu par Plex.
+Type de média attendu : ${mediaType === "series" ? "Série TV" : mediaType === "movie" ? "Film" : "Inconnu"}
+
+Règles de formatage strictes:
+1. Retire tous les tags parasites (1080p, 2160p, 4K, MULTi, FRENCH, TRUEFRENCH, WEB-DL, BluRay, x264, x265, HEVC, team, etc.).
+2. Garde l'extension du fichier s'il y en a une (ex: .mkv, .mp4, .avi). Sinon, ne mets pas d'extension.
+3. Remplace les points (.) et tirets bas (_) dans le titre par des espaces.
+4. Si c'est un FILM (détection possible via une année ou le contexte) : Formate en "Titre du Film (Année).ext". S'il n'y a pas d'année, formate juste en "Titre du Film.ext".
+5. Si c'est une SÉRIE (détection de S01E01, 1x01, Saison X, etc.) : Formate en "Nom de la Série - SXXEXX.ext". (Exemple : "Nom de la Série - S01E03.mkv").
+6. Renvoie UNIQUEMENT le nom formaté, sans aucun autre texte, explication, ni guillemet autour de ta réponse.
+
+Nom de fichier brut à analyser: "${rawName}"
+`;
+
+    const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+    });
+
+    let formattedName = response.text.trim();
+
+    // Fallback minimal au cas où le modèle renverrait une réponse vide ou des erreurs
+    if (!formattedName || formattedName.length > 200 || formattedName.includes('\n')) {
+       return simplifyTorrentName(rawName);
+    }
+
+    return formattedName;
+  } catch (error) {
+    logInfo(`⚠️ Erreur Gemini API: ${error.message}`);
+    return simplifyTorrentName(rawName); // fallback
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -40,6 +89,7 @@ const CONFIG = {
   telegramToken: process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
   telegramChatIds: parseChatIds(process.env.TELEGRAM_CHAT_ID),
+  geminiApiKey: process.env.GEMINI_API_KEY,
   port: parseIntEnv(process.env.PORT, 3000),
   qbit: {
     host: process.env.QBITTORRENT_HOST || "127.0.0.1",
@@ -527,17 +577,71 @@ async function listTorrents(filter = "all") {
   return Array.isArray(torrents) ? torrents : [];
 }
 
-async function addTorrentWithOptions(options) {
-  const payload = {
-    urls: options.source,
-    savepath: options.savePath,
-    category: options.category || "",
-    paused: options.startPaused ? "true" : "false",
-    autoTMM: "false",
-    ...(options.customName ? { rename: options.customName } : {}),
-  };
 
-  await qbitRequest("/torrents/add", "POST", payload);
+async function addTorrentWithOptions(options) {
+  let payload;
+  let headers = {};
+
+  if (options.fileBuffer) {
+    // Si c'est un fichier .torrent
+    const form = new FormData();
+    form.append("torrents", options.fileBuffer, options.fileName || "download.torrent");
+    form.append("savepath", options.savePath);
+    if (options.category) form.append("category", options.category);
+    form.append("paused", options.startPaused ? "true" : "false");
+    form.append("autoTMM", "false");
+    if (options.customName) form.append("rename", options.customName);
+
+    payload = form;
+    headers = form.getHeaders();
+  } else {
+    // Si c'est un lien URL/Magnet
+    payload = {
+      urls: options.source,
+      savepath: options.savePath,
+      category: options.category || "",
+      paused: options.startPaused ? "true" : "false",
+      autoTMM: "false",
+      ...(options.customName ? { rename: options.customName } : {}),
+    };
+  }
+
+  // Effectuer la requête à qBittorrent
+  if (!state.qbitSid) {
+    await qbitLogin();
+  }
+
+  try {
+    const config = {
+      method: 'POST',
+      url: `/torrents/add`,
+      data: payload,
+      headers: {
+        ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
+        ...headers
+      }
+    };
+
+    // On utilise directement l'instance axios qbitHttp car on veut modifier les headers
+    await qbitHttp.request(config);
+  } catch (error) {
+    if (error.response && (error.response.status === 403 || error.response.status === 401)) {
+       // retry login
+       await qbitLogin();
+       const retryConfig = {
+         method: 'POST',
+         url: `/torrents/add`,
+         data: payload,
+         headers: {
+           ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
+           ...headers
+         }
+       };
+       await qbitHttp.request(retryConfig);
+    } else {
+       throw error;
+    }
+  }
 
   if (options.priority && options.priority !== "normal") {
     await applyPriorityBestEffort(options);
@@ -1419,6 +1523,40 @@ bot.onText(/\/export_torrents/i, async (msg) => {
   });
 });
 
+
+bot.on("document", async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isChatAuthorized(chatId)) return;
+
+  const doc = msg.document;
+  if (!doc) return;
+
+  if (!doc.file_name?.endsWith('.torrent') && doc.mime_type !== 'application/x-bittorrent') {
+    return;
+  }
+
+  try {
+    const fileLink = await bot.getFileLink(doc.file_id);
+    const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(response.data);
+
+    // Initialiser une session avec le buffer
+    const source = doc.file_name; // On garde le nom original du fichier comme source
+    initializeTorrentSession(chatId, source, "movie"); // Par défaut, on va demander le type de toute façon
+
+    // On met à jour la session avec le buffer
+    const session = state.torrentSessions.get(chatId);
+    if (session) {
+      session.fileBuffer = buffer;
+      session.fileName = doc.file_name;
+    }
+
+    await askMediaType(chatId);
+  } catch (error) {
+    await safeSendMessage(chatId, `❌ Erreur lors du téléchargement du fichier torrent: ${error.message}`);
+  }
+});
+
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   if (!msg.text || msg.text.startsWith("/")) return;
@@ -1705,6 +1843,7 @@ bot.on("callback_query", async (query) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Notifications de fin de téléchargement
 // ─────────────────────────────────────────────────────────────────────────────
+
 async function checkTorrentCompletions() {
   try {
     if (!state.qbitSid) await qbitLogin();
@@ -1736,19 +1875,48 @@ async function checkTorrentCompletions() {
         ["uploading", "stalledUP", "forcedUP", "pausedUP"].includes(prevState);
 
       if (isCompletedNow && !wasCompletedBefore) {
-        // Notifier tous les chats autorisés
-        const recipients =
-          CONFIG.telegramChatIds.length > 0
-            ? CONFIG.telegramChatIds
-            : [CONFIG.telegramChatId].filter(Boolean);
-        for (const chatId of recipients) {
-          await safeSendMessage(
-            chatId,
-            `✅ *Téléchargement terminé:*\n${simplifyTorrentName(torrent.name)}`,
-            {
-              parse_mode: "Markdown",
-            },
-          );
+        try {
+          let mediaType = "other";
+          if (torrent.category === CONFIG.qbit.categoryMovie || torrent.save_path?.includes(CONFIG.qbit.pathMovie)) mediaType = "movie";
+          if (torrent.category === CONFIG.qbit.categorySeries || torrent.save_path?.includes(CONFIG.qbit.pathSeries)) mediaType = "series";
+
+          // Obtenir le nouveau nom
+          const oldName = torrent.name;
+          const newName = await formatPlexNameWithGemini(oldName, mediaType);
+
+          if (newName && newName !== oldName && newName !== simplifyTorrentName(oldName)) {
+             logInfo(`Renommage automatique: ${oldName} -> ${newName}`);
+
+             // Renommer le dossier principal / fichier dans qBittorrent
+             await qbitRequest("/torrents/rename", "POST", {
+                hash: torrent.hash,
+                name: newName
+             });
+
+             // Mettre à jour torrent.name pour la notification
+             torrent.name = newName;
+          }
+
+          // Notifier tous les chats autorisés
+          const recipients =
+            CONFIG.telegramChatIds.length > 0
+              ? CONFIG.telegramChatIds
+              : [CONFIG.telegramChatId].filter(Boolean);
+
+          for (const chatId of recipients) {
+            await safeSendMessage(
+              chatId,
+              `✅ *Téléchargement terminé:*
+${torrent.name}
+
+_Nom d'origine: ${oldName}_`,
+              {
+                parse_mode: "Markdown",
+              }
+            );
+          }
+        } catch(renameError) {
+           logInfo(`⚠️ Erreur lors du renommage automatique de ${torrent.name}: ${renameError.message}`);
         }
       }
 
@@ -1769,6 +1937,7 @@ async function checkTorrentCompletions() {
     // Ignorer les erreurs silencieusement pour ne pas spammer les logs
   }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Démarrage
