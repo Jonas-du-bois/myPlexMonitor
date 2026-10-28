@@ -25,7 +25,13 @@ async function formatPlexNameWithGemini(rawName, mediaType) {
   }
 
   try {
-    const ai = new GoogleGenAI({ apiKey: CONFIG.geminiApiKey });
+    let ai;
+    try {
+      ai = new GoogleGenAI({ apiKey: CONFIG.geminiApiKey });
+    } catch (e) {
+      logInfo(`⚠️ Impossible d'initialiser GoogleGenAI : ${e.message}`);
+      return simplifyTorrentName(rawName);
+    }
     const prompt = `
 Tu es un assistant expert pour renommer des fichiers multimédias selon les conventions de Plex.
 Tu dois analyser ce nom de fichier brut et le nettoyer pour qu'il soit parfaitement reconnu par Plex.
@@ -347,6 +353,8 @@ app.get("/", (req, res) => {
 
 app.listen(CONFIG.port, () => {
   logInfo(`🌐 API HTTP prête sur le port ${CONFIG.port} (ROLE=${CONFIG.role})`);
+}).on('error', (err) => {
+  logInfo(`⚠️ Erreur de démarrage du serveur HTTP sur le port ${CONFIG.port}: ${err.message}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -596,14 +604,16 @@ async function addTorrentWithOptions(options) {
     headers = form.getHeaders();
   } else {
     // Si c'est un lien URL/Magnet
-    payload = {
+    payload = new URLSearchParams({
       urls: options.source,
       savepath: options.savePath,
       category: options.category || "",
       paused: options.startPaused ? "true" : "false",
       autoTMM: "false",
       ...(options.customName ? { rename: options.customName } : {}),
-    };
+    }).toString();
+
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
   }
 
   // Effectuer la requête à qBittorrent
