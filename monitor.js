@@ -587,34 +587,35 @@ async function listTorrents(filter = "all") {
 
 
 async function addTorrentWithOptions(options) {
-  let payload;
-  let headers = {};
+  const createPayload = () => {
+    if (options.fileBuffer) {
+      // Si c'est un fichier .torrent
+      const form = new FormData();
+      form.append("torrents", options.fileBuffer, {
+        filename: options.fileName || "download.torrent",
+        contentType: "application/x-bittorrent"
+      });
+      form.append("savepath", options.savePath);
+      if (options.category) form.append("category", options.category);
+      form.append("paused", options.startPaused ? "true" : "false");
+      form.append("autoTMM", "false");
+      if (options.customName) form.append("rename", options.customName);
+      return { payload: form, headers: form.getHeaders() };
+    }
 
-  if (options.fileBuffer) {
-    // Si c'est un fichier .torrent
-    const form = new FormData();
-    form.append("torrents", options.fileBuffer, options.fileName || "download.torrent");
-    form.append("savepath", options.savePath);
-    if (options.category) form.append("category", options.category);
-    form.append("paused", options.startPaused ? "true" : "false");
-    form.append("autoTMM", "false");
-    if (options.customName) form.append("rename", options.customName);
-
-    payload = form;
-    headers = form.getHeaders();
-  } else {
     // Si c'est un lien URL/Magnet
-    payload = new URLSearchParams({
-      urls: options.source,
-      savepath: options.savePath,
-      category: options.category || "",
-      paused: options.startPaused ? "true" : "false",
-      autoTMM: "false",
-      ...(options.customName ? { rename: options.customName } : {}),
-    }).toString();
-
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-  }
+    return {
+      payload: new URLSearchParams({
+        urls: options.source,
+        savepath: options.savePath,
+        category: options.category || "",
+        paused: options.startPaused ? "true" : "false",
+        autoTMM: "false",
+        ...(options.customName ? { rename: options.customName } : {}),
+      }).toString(),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    };
+  };
 
   // Effectuer la requête à qBittorrent
   if (!state.qbitSid) {
@@ -622,6 +623,7 @@ async function addTorrentWithOptions(options) {
   }
 
   try {
+    const { payload, headers } = createPayload();
     const config = {
       method: 'POST',
       url: `/torrents/add`,
@@ -638,13 +640,14 @@ async function addTorrentWithOptions(options) {
     if (error.response && (error.response.status === 403 || error.response.status === 401)) {
        // retry login
        await qbitLogin();
+       const { payload: retryPayload, headers: retryHeaders } = createPayload();
        const retryConfig = {
          method: 'POST',
          url: `/torrents/add`,
-         data: payload,
+         data: retryPayload,
          headers: {
            ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
-           ...headers
+           ...retryHeaders
          }
        };
        await qbitHttp.request(retryConfig);
@@ -1743,27 +1746,31 @@ bot.on("callback_query", async (query) => {
       }
 
       if (data === "tw:confirm") {
-        await addTorrentWithOptions(session);
-        state.torrentSessions.delete(chatId);
-        state.awaitingCustomPath.delete(chatId);
+        try {
+          await addTorrentWithOptions(session);
+          state.torrentSessions.delete(chatId);
+          state.awaitingCustomPath.delete(chatId);
 
-        await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "📥 Voir les torrents", callback_data: "dl:refresh" },
-                { text: "⏸️ Pause tout", callback_data: "dl:batch:pause" },
+          await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "📥 Voir les torrents", callback_data: "dl:refresh" },
+                  { text: "⏸️ Pause tout", callback_data: "dl:batch:pause" },
+                ],
+                [
+                  { text: "▶️ Reprendre tout", callback_data: "dl:batch:resume" },
+                  {
+                    text: "🗑️ Nettoyer terminés",
+                    callback_data: "dl:batch:cleanup",
+                  },
+                ],
               ],
-              [
-                { text: "▶️ Reprendre tout", callback_data: "dl:batch:resume" },
-                {
-                  text: "🗑️ Nettoyer terminés",
-                  callback_data: "dl:batch:cleanup",
-                },
-              ],
-            ],
-          },
-        });
+            },
+          });
+        } catch (error) {
+          await safeSendMessage(chatId, `❌ Erreur lors de l'ajout du torrent: ${error.message}`);
+        }
         return;
       }
     }
