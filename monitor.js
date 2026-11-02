@@ -19,6 +19,35 @@ const execFileAsync = promisify(execFile);
 // ─────────────────────────────────────────────────────────────────────────────
 // Formatage Plex via Gemini (IA)
 // ─────────────────────────────────────────────────────────────────────────────
+const MEDIA_NOISE_PATTERN =
+  /\b(?:multi|multi audio|french|truefrench|vf2|vff|vostfr|vo|dubbed|dub|english|german|spanish|italian|japanese|korean|russian|polish|original|dual audio|5\.1|7\.1|1080p|2160p|720p|4k|uhd|hdr10?\+?|web[- ]?dl|web[- ]?rip|blu[- ]?ray|brrip|dvdrip|x264|x265|h\.?264|h\.?265|hevc|avc|aac|dts|truehd|atmos|proper|repack|remux|limited|internal)\b/gi;
+
+function normalizeMediaName(name, rawName) {
+  const rawExtension = path.extname(rawName || "").toLowerCase();
+  let normalized = String(name || "")
+    .replace(/```(?:text|plaintext)?/gi, "")
+    .replace(/```/g, "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(MEDIA_NOISE_PATTERN, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\s+-\s+(?:MULTI|FRENCH|VOSTFR|WEB[- ]?DL).*$/i, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return "";
+  const generatedExtension = path.extname(normalized).toLowerCase();
+  const extension = generatedExtension || rawExtension;
+  const stem = (
+    generatedExtension
+      ? normalized.slice(0, -generatedExtension.length)
+      : normalized
+  )
+    .replace(/[._]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${stem}${extension}`;
+}
+
 async function formatPlexNameWithGemini(rawName, mediaType) {
   if (!CONFIG.geminiApiKey) {
     logInfo("⚠️ GEMINI_API_KEY non configurée, fallback sur simplifyTorrentName");
@@ -39,12 +68,14 @@ Tu dois analyser ce nom de fichier brut et le nettoyer pour qu'il soit parfaitem
 Type de média attendu : ${mediaType === "series" ? "Série TV" : mediaType === "movie" ? "Film" : "Inconnu"}
 
 Règles de formatage strictes:
-1. Retire tous les tags parasites (1080p, 2160p, 4K, MULTi, FRENCH, TRUEFRENCH, WEB-DL, BluRay, x264, x265, HEVC, team, etc.).
-2. Garde l'extension du fichier s'il y en a une (ex: .mkv, .mp4, .avi). Sinon, ne mets pas d'extension.
-3. Remplace les points (.) et tirets bas (_) dans le titre par des espaces.
-4. Si c'est un FILM (détection possible via une année ou le contexte) : Formate en "Titre du Film (Année).ext". S'il n'y a pas d'année, formate juste en "Titre du Film.ext".
-5. Si c'est une SÉRIE (détection de S01E01, 1x01, Saison X, etc.) : Formate en "Nom de la Série - SXXEXX.ext". (Exemple : "Nom de la Série - S01E03.mkv").
-6. Renvoie UNIQUEMENT le nom formaté, sans aucun autre texte, explication, ni guillemet autour de ta réponse.
+1. Identifie le titre officiel le plus courant, tel qu'il est écrit sur IMDb ou dans les bases de données publiques. Ne traduis pas le titre et ne l'invente pas.
+2. Supprime absolument toute langue et tout tag technique ou commercial : FRENCH, VF, VFF, VOSTFR, MULTI, VO, ENGLISH, GERMAN, DUBBED, TRUEFRENCH, 1080p, 2160p, WEB-DL, BluRay, x264, x265, HEVC, HDR, codecs, audio, groupe, édition et qualité.
+3. La réponse ne doit contenir que le titre, l'année et l'épisode lorsque celui-ci existe. Ne renvoie jamais la langue, même si elle apparaît dans le nom brut.
+4. Pour un FILM : "Titre officiel (Année).ext". Si l'année est inconnue, utilise "Titre officiel.ext". L'année doit être l'année de sortie du film, pas une année de qualité ou de téléchargement.
+5. Pour une SÉRIE : "Titre officiel - SXXEXX.ext" (exemple : "Breaking Bad - S01E03.mkv"). Conserve également un numéro d'épisode spécial si présent.
+6. Garde l'extension du fichier s'il y en a une. Sinon, ne mets pas d'extension.
+7. Utilise des espaces normaux, sans points ni tirets bas dans le titre. N'ajoute aucun texte autour.
+8. Renvoie UNIQUEMENT le nom final, sans explication, sans préfixe, sans Markdown et sans guillemets.
 
 Nom de fichier brut à analyser: "${rawName}"
 `;
@@ -62,7 +93,7 @@ Nom de fichier brut à analyser: "${rawName}"
       ),
     ]);
 
-    let formattedName = response.text.trim().replace(/^["']|["']$/g, "");
+    let formattedName = normalizeMediaName(response.text.trim(), rawName);
 
     // Fallback minimal au cas où le modèle renverrait une réponse vide ou des erreurs
     if (
@@ -71,7 +102,7 @@ Nom de fichier brut à analyser: "${rawName}"
       formattedName.includes("\n") ||
       /[\\/\0-\x1f]/.test(formattedName)
     ) {
-       return simplifyTorrentName(rawName);
+      return simplifyTorrentName(rawName);
     }
 
     return formattedName;
@@ -309,6 +340,7 @@ function simplifyTorrentName(name) {
       /\b(1080p|2160p|720p|x264|x265|h\.?264|h\.?265|bluray|webrip|web-dl|dvdrip|proper|repack|multi|french|vostfr)\b/gi,
       " ",
     )
+    .replace(MEDIA_NOISE_PATTERN, " ")
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || name;

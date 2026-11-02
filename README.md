@@ -32,6 +32,8 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
 - Le choix Film/Série applique automatiquement le dossier et la catégorie correspondants.
 - Le bouton de renommage intelligent utilise Gemini Flash via Google AI Studio
   (`GEMINI_API_KEY`) et revient à un nettoyage local si l'API est indisponible.
+  Gemini conserve uniquement le titre officiel, l'année et l'épisode éventuel :
+  les langues (VF, VOSTFR, MULTI, etc.) et les tags techniques sont supprimés.
 - `/downloads [all|active|paused|completed]`
 - `/disk` (ou `/space`) pour voir l'espace libre des dossiers Films, Séries et Autre
 - `/pause [id|nom]`, `/resume [id|nom]`, `/delete [id|nom]`
