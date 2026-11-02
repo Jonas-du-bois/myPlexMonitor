@@ -48,16 +48,38 @@ Règles de formatage strictes:
 Nom de fichier brut à analyser: "${rawName}"
 `;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: CONFIG.geminiModel,
         contents: prompt,
-    });
+      }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("délai Gemini dépassé")),
+          CONFIG.geminiTimeoutMs,
+        ),
+      ),
+    ]);
 
-    let formattedName = response.text.trim();
+    let formattedName = response.text.trim().replace(/^["']|["']$/g, "");
 
     // Fallback minimal au cas où le modèle renverrait une réponse vide ou des erreurs
-    if (!formattedName || formattedName.length > 200 || formattedName.includes('\n')) {
+    if (
+      !formattedName ||
+      formattedName.length > 200 ||
+      formattedName.includes("\n") ||
+      /[\\/\0-\x1f]/.test(formattedName)
+    ) {
        return simplifyTorrentName(rawName);
+    }
+
+    function getTorrentSourceName(source) {
+      if (!source) return "torrent";
+      if (source.startsWith("magnet:")) {
+        const displayName = source.match(/[?&]dn=([^&]+)/i)?.[1];
+        return displayName ? decodeURIComponent(displayName) : "torrent";
+      }
+      return path.basename(source).replace(/\.torrent$/i, "");
     }
 
     return formattedName;
@@ -113,6 +135,8 @@ const CONFIG = {
       20,
     ),
   },
+  geminiModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+  geminiTimeoutMs: parseIntEnv(process.env.GEMINI_TIMEOUT_MS, 10000),
 };
 
 if (!CONFIG.telegramToken) {
@@ -621,7 +645,7 @@ async function qbitMultipartRequest(filePath, options, retry = true) {
       maxBodyLength: Infinity,
     });
 
-    return response.data;
+    return validateTorrentAddResponse(response.data);
   } catch (error) {
     if (retry && [401, 403].includes(error.response?.status || 0)) {
       state.qbitSid = null;
@@ -629,6 +653,13 @@ async function qbitMultipartRequest(filePath, options, retry = true) {
     }
     throw error;
   }
+}
+
+function validateTorrentAddResponse(responseData) {
+  if (typeof responseData === "string" && responseData.trim() !== "Ok.") {
+    throw new Error(`qBittorrent a refusé le torrent (${responseData.trim()})`);
+  }
+  return responseData;
 }
 
 async function listTorrents(filter = "all") {
@@ -649,14 +680,27 @@ async function addTorrentWithOptions(options) {
     ...(options.customName ? { rename: options.customName } : {}),
   };
 
+  let existingHashes = new Set();
+  if (options.priority && options.priority !== "normal") {
+    try {
+      existingHashes = new Set(
+        (await listTorrents("all")).map((torrent) => torrent.hash),
+      );
+    } catch (error) {
+      logInfo(`⚠️ Priorité différée: ${error.message}`);
+    }
+  }
+
   if (options.sourceType === "file") {
     await qbitMultipartRequest(options.source, options);
   } else {
-    await qbitRequest("/torrents/add", "POST", payload);
+    validateTorrentAddResponse(
+      await qbitRequest("/torrents/add", "POST", payload),
+    );
   }
 
   if (options.priority && options.priority !== "normal") {
-    await applyPriorityBestEffort(options);
+    await applyPriorityBestEffort({ ...options, existingHashes });
   }
 }
 
@@ -665,7 +709,11 @@ async function applyPriorityBestEffort(options) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const torrents = await listTorrents("all");
     const candidates = torrents
-      .filter((torrent) => torrent.save_path?.startsWith(options.savePath))
+      .filter(
+        (torrent) =>
+          !options.existingHashes?.has(torrent.hash) &&
+          torrent.save_path?.startsWith(options.savePath),
+      )
       .sort((a, b) => (b.added_on || 0) - (a.added_on || 0));
 
     if (candidates.length === 0) return;
@@ -930,6 +978,14 @@ function initializeTorrentSession(
 
   const selected = defaults[mediaType] || defaults.movie;
 
+  const previous = state.torrentSessions.get(chatId);
+  if (previous && previous.source !== source) {
+    cleanupTorrentSource(previous).catch((error) =>
+      logInfo(`⚠️ Nettoyage session torrent impossible: ${error.message}`),
+    );
+  }
+  state.awaitingCustomPath.delete(chatId);
+  state.awaitingCustomName.delete(chatId);
   state.torrentSessions.set(chatId, {
     source,
     sourceType,
@@ -939,12 +995,43 @@ function initializeTorrentSession(
     priority: "normal",
     startPaused: false,
     customName: null,
+    updatedAt: Date.now(),
   });
 }
 
 async function cleanupTorrentSource(session) {
   if (session?.sourceType !== "file") return;
   await fs.rm(path.dirname(session.source), { recursive: true, force: true });
+}
+
+async function cleanupExpiredTorrentSessions() {
+  const expirationMs = 15 * 60 * 1000;
+  const now = Date.now();
+  for (const [chatId, session] of state.torrentSessions) {
+    if (now - (session.updatedAt || now) <= expirationMs) continue;
+    await cleanupTorrentSource(session);
+    state.torrentSessions.delete(chatId);
+    state.awaitingCustomPath.delete(chatId);
+    state.awaitingCustomName.delete(chatId);
+    await safeSendMessage(chatId, "⌛ Ajout annulé après 15 min d'inactivité.");
+  }
+
+  async function cleanupStaleTorrentUploads() {
+    const entries = await fs.readdir(os.tmpdir(), { withFileTypes: true });
+    await Promise.all(
+      entries
+        .filter(
+          (entry) =>
+            entry.isDirectory() && entry.name.startsWith("myplexmonitor-torrent-"),
+        )
+        .map((entry) =>
+          fs.rm(path.join(os.tmpdir(), entry.name), {
+            recursive: true,
+            force: true,
+          }),
+        ),
+    );
+  }
 }
 
 async function askMediaType(chatId) {
@@ -957,71 +1044,6 @@ async function askMediaType(chatId) {
         ],
         [{ text: "📦 Autre", callback_data: "tw:type:other" }],
         [{ text: "❌ Annuler", callback_data: "tw:cancel" }],
-      ],
-    },
-  });
-}
-
-async function askSavePath(chatId) {
-  await safeSendMessage(chatId, "📂 Choisis le dossier de destination:", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🎬 Dossier Films", callback_data: "tw:path:movie" }],
-        [{ text: "📺 Dossier Séries", callback_data: "tw:path:series" }],
-        [{ text: "📦 Dossier Autre", callback_data: "tw:path:other" }],
-        [
-          {
-            text: "✍️ Saisir un chemin personnalisé",
-            callback_data: "tw:path:custom",
-          },
-        ],
-      ],
-    },
-  });
-}
-
-async function askCategory(chatId) {
-  await safeSendMessage(chatId, "🏷️ Choisis une catégorie qBittorrent:", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🎬 movies", callback_data: "tw:cat:movie" },
-          { text: "📺 series", callback_data: "tw:cat:series" },
-        ],
-        [
-          { text: "📦 other", callback_data: "tw:cat:other" },
-          { text: "➖ Aucune", callback_data: "tw:cat:none" },
-        ],
-      ],
-    },
-  });
-}
-
-async function askPriority(chatId) {
-  await safeSendMessage(chatId, "⚡ Choisis la priorité de file:", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🔺 Haute", callback_data: "tw:prio:high" },
-          { text: "⏺️ Normale", callback_data: "tw:prio:normal" },
-          { text: "🔻 Basse", callback_data: "tw:prio:low" },
-        ],
-      ],
-    },
-  });
-}
-
-async function askStartMode(chatId) {
-  await safeSendMessage(chatId, "▶️ Démarrage du torrent:", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "▶️ Démarrer tout de suite",
-            callback_data: "tw:paused:false",
-          },
-          { text: "⏸️ Ajouter en pause", callback_data: "tw:paused:true" },
-        ],
       ],
     },
   });
@@ -1040,22 +1062,32 @@ function buildTorrentSummary(session) {
 }
 
 async function askConfirmation(chatId, session) {
+  session.updatedAt = Date.now();
   await safeSendMessage(chatId, buildTorrentSummary(session), {
     parse_mode: "Markdown",
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "✅ Confirmer l'ajout", callback_data: "tw:confirm" },
-          { text: "✏️ Modifier dossier", callback_data: "tw:path:custom" },
+          { text: "▶️ Démarrer", callback_data: "tw:paused:false" },
+          { text: "⏸️ En pause", callback_data: "tw:paused:true" },
         ],
         [
+          { text: "🔺 Haute", callback_data: "tw:prio:high" },
+          { text: "⏺️ Normale", callback_data: "tw:prio:normal" },
+          { text: "🔻 Basse", callback_data: "tw:prio:low" },
+        ],
+        [
+          { text: "📂 Dossier avancé", callback_data: "tw:path:custom" },
           {
             text: "✏️ Renommer (intelligent)",
             callback_data: "tw:rename:smart",
           },
           { text: "✍️ Renommer (manuel)", callback_data: "tw:rename:manual" },
         ],
-        [{ text: "❌ Annuler", callback_data: "tw:cancel" }],
+        [
+          { text: "✅ Ajouter", callback_data: "tw:confirm" },
+          { text: "❌ Annuler", callback_data: "tw:cancel" },
+        ],
       ],
     },
   });
@@ -1150,9 +1182,35 @@ bot.onText(/\/start/, async (msg) => {
   await withAuthorizedChat(chatId, async () => {
     await safeSendMessage(
       chatId,
-      `👋 *MyPlexMonitor prêt*\n\nRôle actif: *${CONFIG.role}*\n\nUtilise /help pour voir toutes les commandes.`,
-      { parse_mode: "Markdown" },
+      `👋 *MyPlexMonitor*\nRôle: *${CONFIG.role}*\n\nChoisis une action:`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🎬 Ajouter un film", callback_data: "menu:movie" },
+              { text: "📺 Ajouter une série", callback_data: "menu:series" },
+            ],
+            [
+              { text: "📥 Téléchargements", callback_data: "menu:downloads" },
+              { text: "❓ Aide", callback_data: "menu:help" },
+            ],
+          ],
+        },
+      },
     );
+  });
+});
+
+bot.onText(/\/cancel/i, async (msg) => {
+  const chatId = msg.chat.id;
+  await withAuthorizedChat(chatId, async () => {
+    const session = state.torrentSessions.get(chatId);
+    await cleanupTorrentSource(session);
+    state.torrentSessions.delete(chatId);
+    state.awaitingCustomPath.delete(chatId);
+    state.awaitingCustomName.delete(chatId);
+    await safeSendMessage(chatId, "❌ Annulé.");
   });
 });
 
@@ -1298,7 +1356,7 @@ bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
       return;
     }
     initializeTorrentSession(chatId, source, "movie");
-    await askPriority(chatId);
+    await askConfirmation(chatId, state.torrentSessions.get(chatId));
   });
 });
 
@@ -1311,7 +1369,7 @@ bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
       return;
     }
     initializeTorrentSession(chatId, source, "series");
-    await askPriority(chatId);
+    await askConfirmation(chatId, state.torrentSessions.get(chatId));
   });
 });
 
@@ -1551,7 +1609,10 @@ bot.on("message", async (msg) => {
   if (!isChatAuthorized(chatId)) return;
 
   if (msg.document) {
-    if (!msg.document.file_name?.toLowerCase().endsWith(".torrent")) {
+    const isTorrent =
+      msg.document.file_name?.toLowerCase().endsWith(".torrent") ||
+      msg.document.mime_type === "application/x-bittorrent";
+    if (!isTorrent) {
       await safeSendMessage(chatId, "❌ Le fichier doit avoir l'extension .torrent.");
       return;
     }
@@ -1579,7 +1640,12 @@ bot.on("message", async (msg) => {
         uploadDirectory,
       );
       await fs.rename(downloadedPath, uploadedPath);
-      await fs.access(uploadedPath);
+      const downloadedStat = await fs.stat(uploadedPath);
+      if (downloadedStat.size > maxSize) {
+        throw new Error(
+          `fichier téléchargé trop volumineux (maximum ${CONFIG.qbit.maxTorrentFileSizeMb} Mo)`,
+        );
+      }
       initializeTorrentSession(chatId, uploadedPath, "movie", "file");
       await askMediaType(chatId);
     } catch (error) {
@@ -1617,7 +1683,7 @@ bot.on("message", async (msg) => {
 
   session.savePath = msg.text.trim();
   state.awaitingCustomPath.delete(chatId);
-  await askCategory(chatId);
+  await askConfirmation(chatId, session);
 });
 
 bot.on("callback_query", async (query) => {
@@ -1631,6 +1697,23 @@ bot.on("callback_query", async (query) => {
   await bot.answerCallbackQuery(query.id).catch(() => null);
 
   try {
+    if (data === "menu:movie" || data === "menu:series") {
+      const command = data.endsWith("movie") ? "/movie" : "/series";
+      await safeSendMessage(
+        chatId,
+        `Envoie ${command} suivi du lien magnet ou URL du torrent.`,
+      );
+      return;
+    }
+    if (data === "menu:downloads") {
+      await renderDownloads(chatId);
+      return;
+    }
+    if (data === "menu:help") {
+      await safeSendMessage(chatId, "Utilise /movie, /series ou envoie un fichier .torrent.");
+      return;
+    }
+
     if (data.startsWith("tw:")) {
       const session = state.torrentSessions.get(chatId);
       if (!session && data !== "tw:cancel") {
@@ -1642,6 +1725,7 @@ bot.on("callback_query", async (query) => {
         await cleanupTorrentSource(session);
         state.torrentSessions.delete(chatId);
         state.awaitingCustomPath.delete(chatId);
+        state.awaitingCustomName.delete(chatId);
         await safeSendMessage(chatId, "❌ Ajout du torrent annulé.");
         return;
       }
@@ -1654,7 +1738,7 @@ bot.on("callback_query", async (query) => {
           mediaType,
           session.sourceType,
         );
-        await askSavePath(chatId);
+        await askConfirmation(chatId, state.torrentSessions.get(chatId));
         return;
       }
 
@@ -1675,7 +1759,7 @@ bot.on("callback_query", async (query) => {
         if (pathType === "movie") session.savePath = CONFIG.qbit.pathMovie;
         if (pathType === "series") session.savePath = CONFIG.qbit.pathSeries;
         if (pathType === "other") session.savePath = CONFIG.qbit.pathOther;
-        await askCategory(chatId);
+        await askConfirmation(chatId, session);
         return;
       }
 
@@ -1689,13 +1773,13 @@ bot.on("callback_query", async (query) => {
               : cat === "series"
                 ? CONFIG.qbit.categorySeries
                 : CONFIG.qbit.categoryOther;
-        await askPriority(chatId);
+        await askConfirmation(chatId, session);
         return;
       }
 
       if (data.startsWith("tw:prio:")) {
         session.priority = data.split(":")[2];
-        await askStartMode(chatId);
+        await askConfirmation(chatId, session);
         return;
       }
 
@@ -1719,60 +1803,20 @@ bot.on("callback_query", async (query) => {
       }
 
       if (data === "tw:rename:smart") {
-        // Essayer de simplifier le nom basé sur le nom existant
-        const matchName = session.source.match(/dn=([^&]+)/);
-        if (matchName && matchName[1]) {
-          const originalName = decodeURIComponent(matchName[1]);
-          const smartName = simplifyTorrentName(originalName);
-
-          state.awaitingCustomName.add(chatId);
-          await safeSendMessage(
-            chatId,
-            `🤖 Proposition: "${smartName}"\n\nSi cela te convient, copie/colle ou tape un autre nom.`,
-            {
-              reply_markup: { force_reply: true },
-            },
-          );
-        } else if (!session.source.startsWith("magnet:")) {
-          const parts = session.source.split("/");
-          let fileName = parts[parts.length - 1];
-          if (fileName) {
-            fileName = fileName.replace(".torrent", "");
-            const smartName = simplifyTorrentName(fileName);
-            state.awaitingCustomName.add(chatId);
-            await safeSendMessage(
-              chatId,
-              `🤖 Proposition: "${smartName}"\n\nSi cela te convient, copie/colle ou tape un autre nom.`,
-              {
-                reply_markup: { force_reply: true },
-              },
-            );
-          } else {
-            state.awaitingCustomName.add(chatId);
-            await safeSendMessage(
-              chatId,
-              "⚠️ Impossible de déduire le nom depuis le lien. Tape manuellement le nouveau nom:",
-              {
-                reply_markup: { force_reply: true },
-              },
-            );
-          }
-        } else {
-          state.awaitingCustomName.add(chatId);
-          await safeSendMessage(
-            chatId,
-            "⚠️ Impossible de déduire le nom depuis le lien magnet. Tape manuellement le nouveau nom:",
-            {
-              reply_markup: { force_reply: true },
-            },
-          );
-        }
+        const sourceName = getTorrentSourceName(session.source);
+        session.customName = await formatPlexNameWithGemini(
+          sourceName,
+          session.mediaType,
+        );
+        await askConfirmation(chatId, session);
         return;
       }
 
       if (data === "tw:confirm") {
+        let added = false;
         try {
           await addTorrentWithOptions(session);
+          added = true;
           await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
             reply_markup: {
               inline_keyboard: [
@@ -1794,11 +1838,23 @@ bot.on("callback_query", async (query) => {
           await safeSendMessage(
             chatId,
             `❌ Échec de l'ajout du torrent: ${error.message}`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: "🔁 Réessayer", callback_data: "tw:confirm" },
+                    { text: "❌ Annuler", callback_data: "tw:cancel" },
+                  ],
+                ],
+              },
+            },
           );
         } finally {
+          if (!added) return;
           await cleanupTorrentSource(session);
           state.torrentSessions.delete(chatId);
           state.awaitingCustomPath.delete(chatId);
+          state.awaitingCustomName.delete(chatId);
         }
         return;
       }
@@ -1990,6 +2046,22 @@ _Nom d'origine: ${oldName}_`,
 // ─────────────────────────────────────────────────────────────────────────────
 (async () => {
   logInfo(`🚀 MyPlexMonitor démarré en mode ${CONFIG.role}.`);
+  await cleanupStaleTorrentUploads().catch((error) =>
+    logInfo(`⚠️ Nettoyage temporaire impossible: ${error.message}`),
+  );
+  await bot
+    .setMyCommands([
+      { command: "start", description: "Ouvrir le menu principal" },
+      { command: "movie", description: "Ajouter un film" },
+      { command: "series", description: "Ajouter une série" },
+      { command: "torrent", description: "Ajouter un torrent" },
+      { command: "downloads", description: "Voir les téléchargements" },
+      { command: "cancel", description: "Annuler l'action en cours" },
+      { command: "help", description: "Afficher l'aide" },
+    ])
+    .catch((error) =>
+      logInfo(`⚠️ Commandes Telegram non enregistrées: ${error.message}`),
+    );
 
   if (CONFIG.role === "LOCAL") {
     const diagnostics = await getUbuntuDiagnostics();
@@ -2002,5 +2074,6 @@ _Nom d'origine: ${oldName}_`,
   await autoCheck();
   setInterval(autoCheck, CONFIG.checkInterval);
   setInterval(checkTorrentCompletions, 60000); // Check every minute
+  setInterval(cleanupExpiredTorrentSessions, 60000);
   checkTorrentCompletions(); // Initial check
 })();

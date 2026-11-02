@@ -29,6 +29,9 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
   - confirmation + actions rapides
 - Envoi direct d'un fichier `.torrent` dans Telegram avec le même assistant
   (le fichier est envoyé à qBittorrent via multipart puis supprimé du dossier temporaire)
+- Le choix Film/Série applique automatiquement le dossier et la catégorie correspondants.
+- Le bouton de renommage intelligent utilise Gemini Flash via Google AI Studio
+  (`GEMINI_API_KEY`) et revient à un nettoyage local si l'API est indisponible.
 - `/downloads [all|active|paused|completed]`
 - `/pause [id|nom]`, `/resume [id|nom]`, `/delete [id|nom]`
 - Sans argument sur `/pause`, `/resume`, `/delete`: affichage des torrents actionnables avec boutons Telegram
@@ -69,6 +72,8 @@ Variables qBittorrent recommandées:
 - `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD`
 - `MOVIES_PATH`, `SERIES_PATH`, `OTHER_PATH`
 - `MAX_TORRENT_FILE_SIZE_MB` (optionnel, 20 Mo par défaut)
+- `GEMINI_API_KEY` (optionnel, Google AI Studio)
+- `GEMINI_MODEL`, `GEMINI_TIMEOUT_MS` (optionnels)
 
 ---
 
