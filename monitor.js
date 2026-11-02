@@ -89,6 +89,43 @@ function getTorrentSourceName(source) {
   return path.basename(source).replace(/\.torrent$/i, "");
 }
 
+function magnetHasDisplayName(source) {
+  return /^magnet:/i.test(source || "") && Boolean(source.match(/[?&]dn=/i));
+}
+
+async function prepareSmartTorrentName(chatId, session) {
+  if (
+    session.sourceType !== "file" &&
+    /^magnet:/i.test(session.source) &&
+    !magnetHasDisplayName(session.source)
+  ) {
+    session.renameWithGeminiAfterAdd = true;
+    session.customName = null;
+    await safeSendMessage(
+      chatId,
+      "ℹ️ Ce magnet n'a pas encore de nom. Il sera ajouté d'abord, puis Gemini analysera son nom dès que qBittorrent aura reçu ses métadonnées.",
+    );
+    return;
+  }
+
+  await safeSendMessage(chatId, "🤖 Gemini analyse le nom du torrent…");
+  const sourceName = getTorrentSourceName(session.source);
+  const proposedName = await formatPlexNameWithGemini(
+    sourceName,
+    session.mediaType,
+  );
+  session.customName = proposedName;
+
+  if (CONFIG.geminiApiKey) {
+    await safeSendMessage(chatId, `✅ Nom proposé : ${proposedName}`);
+  } else {
+    await safeSendMessage(
+      chatId,
+      `ℹ️ Gemini n'est pas configuré. Nettoyage local proposé : ${proposedName}`,
+    );
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +196,7 @@ const state = {
   lastCheckReason: "Aucune vérification encore effectuée",
   telegramPollingActive: CONFIG.role === "LOCAL",
   torrentSessions: new Map(),
+  torrentUploads: new Map(),
   awaitingCustomPath: new Set(),
   awaitingCustomName: new Set(),
   downloadsView: new Map(),
@@ -167,6 +205,7 @@ const state = {
   torrentHashesByAlias: new Map(),
   nextTorrentAlias: 1,
   trackedTorrents: new Map(),
+  lastQbitErrorAlertAt: 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -587,7 +626,13 @@ async function qbitLogin() {
   state.qbitSid = sidCookie ? sidCookie.split(";")[0] : null;
 }
 
-async function qbitRequest(path, method = "GET", data = null, retry = true) {
+async function qbitRequest(
+  path,
+  method = "GET",
+  data = null,
+  retry = true,
+  signal = undefined,
+) {
   try {
     if (!state.qbitSid) {
       await qbitLogin();
@@ -598,19 +643,25 @@ async function qbitRequest(path, method = "GET", data = null, retry = true) {
       method,
       headers: state.qbitSid ? { Cookie: state.qbitSid } : {},
       data: data ? new URLSearchParams(data).toString() : undefined,
+      signal,
     });
 
     return response.data;
   } catch (error) {
     if (retry && [401, 403].includes(error.response?.status || 0)) {
       state.qbitSid = null;
-      return qbitRequest(path, method, data, false);
+      return qbitRequest(path, method, data, false, signal);
     }
     throw error;
   }
 }
 
-async function qbitMultipartRequest(filePath, options, retry = true) {
+async function qbitMultipartRequest(
+  filePath,
+  options,
+  retry = true,
+  signal = undefined,
+) {
   try {
     if (!state.qbitSid) {
       await qbitLogin();
@@ -647,13 +698,14 @@ async function qbitMultipartRequest(filePath, options, retry = true) {
         ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
       },
       maxBodyLength: Infinity,
+      signal,
     });
 
     return validateTorrentAddResponse(response.data);
   } catch (error) {
     if (retry && [401, 403].includes(error.response?.status || 0)) {
       state.qbitSid = null;
-      return qbitMultipartRequest(filePath, options, false);
+      return qbitMultipartRequest(filePath, options, false, signal);
     }
     throw error;
   }
@@ -685,26 +737,97 @@ async function addTorrentWithOptions(options) {
   };
 
   let existingHashes = new Set();
+  try {
+    existingHashes = new Set(
+      (await listTorrents("all")).map((torrent) => torrent.hash),
+    );
+  } catch (error) {
+    logInfo(`⚠️ Identification du torrent ajouté différée: ${error.message}`);
+  }
   if (options.priority && options.priority !== "normal") {
-    try {
-      existingHashes = new Set(
-        (await listTorrents("all")).map((torrent) => torrent.hash),
-      );
-    } catch (error) {
-      logInfo(`⚠️ Priorité différée: ${error.message}`);
-    }
+    logInfo("ℹ️ Recherche du torrent ajouté pour appliquer sa priorité.");
   }
 
   if (options.sourceType === "file") {
-    await qbitMultipartRequest(options.source, options);
+    await qbitMultipartRequest(options.source, options, true, options.signal);
   } else {
     validateTorrentAddResponse(
-      await qbitRequest("/torrents/add", "POST", payload),
+      await qbitRequest(
+        "/torrents/add",
+        "POST",
+        payload,
+        true,
+        options.signal,
+      ),
     );
   }
 
   if (options.priority && options.priority !== "normal") {
     await applyPriorityBestEffort({ ...options, existingHashes });
+  }
+
+  return findAddedTorrent(existingHashes, options.savePath);
+}
+
+async function findAddedTorrent(existingHashes, savePath) {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      const torrents = await listTorrents("all");
+      const added = torrents
+        .filter(
+          (torrent) =>
+            !existingHashes.has(torrent.hash) &&
+            torrent.save_path?.startsWith(savePath),
+        )
+        .sort((a, b) => (b.added_on || 0) - (a.added_on || 0))[0];
+      if (added) return added;
+    } catch (error) {
+      logInfo(`⚠️ Identification du torrent ajouté impossible: ${error.message}`);
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  return null;
+}
+
+async function renameAddedMagnetWithGemini(chatId, session, torrent) {
+  if (!session.renameWithGeminiAfterAdd) return;
+  if (!torrent?.hash) {
+    await safeSendMessage(
+      chatId,
+      "⚠️ Le magnet est ajouté, mais qBittorrent n'a pas encore fourni son identité. Utilise le bouton de renommage depuis les téléchargements.",
+    );
+    return;
+  }
+
+  await safeSendMessage(chatId, "⏳ qBittorrent récupère les métadonnées du magnet…");
+  let resolvedTorrent = torrent;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const current = (await listTorrents("all")).find(
+      (item) => item.hash === torrent.hash,
+    );
+    if (current?.name && current.name !== "magnet" && current.name !== torrent.hash) {
+      resolvedTorrent = current;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+
+  const sourceName = resolvedTorrent.name;
+  if (!sourceName || sourceName === "magnet") {
+    await safeSendMessage(chatId, "⚠️ Métadonnées non disponibles. Le torrent reste ajouté.");
+    return;
+  }
+  await safeSendMessage(chatId, "🤖 Gemini analyse le nom réel du magnet…");
+  const newName = await formatPlexNameWithGemini(sourceName, session.mediaType);
+  if (newName && newName !== sourceName) {
+    await qbitRequest("/torrents/rename", "POST", {
+      hash: resolvedTorrent.hash,
+      name: newName,
+    });
+    await safeSendMessage(chatId, `✅ Magnet renommé par Gemini : ${newName}`);
+  } else {
+    await safeSendMessage(chatId, "ℹ️ Gemini n'a pas proposé de changement.");
   }
 }
 
@@ -999,8 +1122,13 @@ function initializeTorrentSession(
     priority: "normal",
     startPaused: false,
     customName: null,
+    renameWithGeminiAfterAdd: false,
     updatedAt: Date.now(),
+    operationController: new AbortController(),
+    signal: null,
   });
+  const session = state.torrentSessions.get(chatId);
+  session.signal = session.operationController.signal;
 }
 
 async function cleanupTorrentSource(session) {
@@ -1038,7 +1166,12 @@ async function cleanupStaleTorrentUploads() {
   );
 }
 
-async function downloadTelegramDocument(fileId, destinationPath, maxBytes) {
+async function downloadTelegramDocument(
+  fileId,
+  destinationPath,
+  maxBytes,
+  signal,
+) {
   let lastError;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -1048,6 +1181,7 @@ async function downloadTelegramDocument(fileId, destinationPath, maxBytes) {
         {
           params: { file_id: fileId },
           timeout: CONFIG.telegramDownloadTimeoutMs,
+          signal,
         },
       );
       const filePath = fileResponse.data?.result?.file_path;
@@ -1060,6 +1194,7 @@ async function downloadTelegramDocument(fileId, destinationPath, maxBytes) {
         timeout: CONFIG.telegramDownloadTimeoutMs,
         maxContentLength: maxBytes,
         maxBodyLength: maxBytes,
+        signal,
         validateStatus: (status) => status >= 200 && status < 300,
       });
       const content = Buffer.from(response.data);
@@ -1253,6 +1388,11 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/cancel/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
+    const upload = state.torrentUploads.get(chatId);
+    if (upload) {
+      upload.controller.abort();
+      await safeSendMessage(chatId, "🛑 Annulation de la réception…");
+    }
     const session = state.torrentSessions.get(chatId);
     await cleanupTorrentSource(session);
     state.torrentSessions.delete(chatId);
@@ -1663,6 +1803,11 @@ bot.on("message", async (msg) => {
   if (msg.document) {
     let uploadDirectory = null;
     let keepUpload = false;
+    const uploadController = new AbortController();
+    state.torrentUploads.set(chatId, {
+      controller: uploadController,
+      directory: null,
+    });
     try {
       const isTorrent =
         msg.document.file_name?.toLowerCase().endsWith(".torrent") ||
@@ -1685,6 +1830,14 @@ bot.on("message", async (msg) => {
       uploadDirectory = await fs.mkdtemp(
         path.join(os.tmpdir(), "myplexmonitor-torrent-"),
       );
+      state.torrentUploads.get(chatId).directory = uploadDirectory;
+      await safeSendMessage(chatId, "📥 Téléchargement depuis Telegram…", {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "❌ Annuler", callback_data: "upload:cancel" },
+          ]],
+        },
+      });
       const uploadedPath = path.join(
         uploadDirectory,
         path.basename(msg.document.file_name || "upload.torrent"),
@@ -1693,6 +1846,7 @@ bot.on("message", async (msg) => {
         msg.document.file_id,
         uploadedPath,
         maxSize,
+        uploadController.signal,
       );
       const downloadedStat = await fs.stat(uploadedPath);
       if (downloadedStat.size > maxSize) {
@@ -1702,14 +1856,30 @@ bot.on("message", async (msg) => {
       }
       initializeTorrentSession(chatId, uploadedPath, "movie", "file");
       keepUpload = true;
-      await askMediaType(chatId);
+      await safeSendMessage(chatId, "✅ Fichier reçu. Choisis son type :", {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🎬 Film", callback_data: "tw:type:movie" },
+              { text: "📺 Série", callback_data: "tw:type:series" },
+            ],
+            [{ text: "📦 Autre", callback_data: "tw:type:other" }],
+            [{ text: "❌ Annuler", callback_data: "tw:cancel" }],
+          ],
+        },
+      });
     } catch (error) {
+      if (error.code === "ERR_CANCELED" || error.name === "CanceledError") {
+        await safeSendMessage(chatId, "❌ Réception du fichier annulée.");
+      } else {
       logInfo(`❌ Upload Telegram échoué: ${error.message}`);
       await safeSendMessage(
         chatId,
         `❌ Impossible de télécharger le fichier torrent: ${error.message}`,
       );
+      }
     } finally {
+      state.torrentUploads.delete(chatId);
       if (uploadDirectory && !keepUpload) {
         await fs.rm(uploadDirectory, { recursive: true, force: true });
       }
@@ -1764,6 +1934,21 @@ bot.on("callback_query", async (query) => {
   await bot.answerCallbackQuery(query.id).catch(() => null);
 
   try {
+    if (data === "upload:cancel") {
+    const upload = state.torrentUploads.get(chatId);
+    if (!upload) {
+      await safeSendMessage(chatId, "ℹ️ Aucun téléchargement en cours.");
+      return;
+    }
+    upload.controller.abort();
+    await bot
+      .answerCallbackQuery(query.id, {
+        text: "Annulation en cours…",
+      })
+      .catch(() => null);
+    return;
+    }
+
     if (data === "menu:movie" || data === "menu:series") {
       const command = data.endsWith("movie") ? "/movie" : "/series";
       await safeSendMessage(
@@ -1789,6 +1974,7 @@ bot.on("callback_query", async (query) => {
       }
 
       if (data === "tw:cancel") {
+        session?.operationController.abort();
         await cleanupTorrentSource(session);
         state.torrentSessions.delete(chatId);
         state.awaitingCustomPath.delete(chatId);
@@ -1805,7 +1991,11 @@ bot.on("callback_query", async (query) => {
           mediaType,
           session.sourceType,
         );
-        await askConfirmation(chatId, state.torrentSessions.get(chatId));
+        const selectedSession = state.torrentSessions.get(chatId);
+        if (selectedSession.sourceType === "file") {
+          await prepareSmartTorrentName(chatId, selectedSession);
+        }
+        await askConfirmation(chatId, selectedSession);
         return;
       }
 
@@ -1870,11 +2060,7 @@ bot.on("callback_query", async (query) => {
       }
 
       if (data === "tw:rename:smart") {
-        const sourceName = getTorrentSourceName(session.source);
-        session.customName = await formatPlexNameWithGemini(
-          sourceName,
-          session.mediaType,
-        );
+        await prepareSmartTorrentName(chatId, session);
         await askConfirmation(chatId, session);
         return;
       }
@@ -1882,7 +2068,8 @@ bot.on("callback_query", async (query) => {
       if (data === "tw:confirm") {
         let added = false;
         try {
-          await addTorrentWithOptions(session);
+          await safeSendMessage(chatId, "⏳ Ajout à qBittorrent en cours…");
+          const addedTorrent = await addTorrentWithOptions(session);
           added = true;
           await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
             reply_markup: {
@@ -1901,7 +2088,11 @@ bot.on("callback_query", async (query) => {
               ],
             },
           });
+          await renameAddedMagnetWithGemini(chatId, session, addedTorrent);
         } catch (error) {
+          if (error.code === "ERR_CANCELED" || error.name === "CanceledError") {
+            await safeSendMessage(chatId, "❌ Ajout annulé.");
+          } else {
           await safeSendMessage(
             chatId,
             `❌ Échec de l'ajout du torrent: ${error.message}`,
@@ -1916,6 +2107,7 @@ bot.on("callback_query", async (query) => {
               },
             },
           );
+          }
         } finally {
           if (!added) return;
           await cleanupTorrentSource(session);
@@ -2045,26 +2237,7 @@ async function checkTorrentCompletions() {
 
       if (isCompletedNow && !wasCompletedBefore) {
         try {
-          let mediaType = "other";
-          if (torrent.category === CONFIG.qbit.categoryMovie || torrent.save_path?.includes(CONFIG.qbit.pathMovie)) mediaType = "movie";
-          if (torrent.category === CONFIG.qbit.categorySeries || torrent.save_path?.includes(CONFIG.qbit.pathSeries)) mediaType = "series";
-
-          // Obtenir le nouveau nom
           const oldName = torrent.name;
-          const newName = await formatPlexNameWithGemini(oldName, mediaType);
-
-          if (newName && newName !== oldName && newName !== simplifyTorrentName(oldName)) {
-             logInfo(`Renommage automatique: ${oldName} -> ${newName}`);
-
-             // Renommer le dossier principal / fichier dans qBittorrent
-             await qbitRequest("/torrents/rename", "POST", {
-                hash: torrent.hash,
-                name: newName
-             });
-
-             // Mettre à jour torrent.name pour la notification
-             torrent.name = newName;
-          }
 
           // Notifier tous les chats autorisés
           const recipients =
@@ -2085,7 +2258,7 @@ _Nom d'origine: ${oldName}_`,
             );
           }
         } catch(renameError) {
-           logInfo(`⚠️ Erreur lors du renommage automatique de ${torrent.name}: ${renameError.message}`);
+           logInfo(`⚠️ Erreur notification fin de téléchargement de ${torrent.name}: ${renameError.message}`);
         }
       }
 
@@ -2103,7 +2276,15 @@ _Nom d'origine: ${oldName}_`,
       }
     }
   } catch (error) {
-    // Ignorer les erreurs silencieusement pour ne pas spammer les logs
+    logInfo(`⚠️ Vérification qBittorrent impossible: ${error.message}`);
+    const now = Date.now();
+    if (now - state.lastQbitErrorAlertAt > 5 * 60 * 1000) {
+      state.lastQbitErrorAlertAt = now;
+      await sendAlert(
+        `⚠️ *qBittorrent indisponible*\n${error.message}\n\nLe bot réessaiera automatiquement.`,
+        { parse_mode: "Markdown" },
+      );
+    }
   }
 }
 
