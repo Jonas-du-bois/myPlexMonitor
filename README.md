@@ -73,7 +73,7 @@ Variables qBittorrent recommandées:
 - `MOVIES_PATH`, `SERIES_PATH`, `OTHER_PATH`
 - `MAX_TORRENT_FILE_SIZE_MB` (optionnel, 20 Mo par défaut)
 - `GEMINI_API_KEY` (optionnel, Google AI Studio)
-- `GEMINI_MODEL`, `GEMINI_TIMEOUT_MS` (optionnels)
+- `GEMINI_MODEL`, `GEMINI_TIMEOUT_MS`, `TELEGRAM_DOWNLOAD_TIMEOUT_MS` (optionnels)
 
 ---
 

@@ -137,6 +137,10 @@ const CONFIG = {
   },
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
   geminiTimeoutMs: parseIntEnv(process.env.GEMINI_TIMEOUT_MS, 10000),
+  telegramDownloadTimeoutMs: parseIntEnv(
+    process.env.TELEGRAM_DOWNLOAD_TIMEOUT_MS,
+    30000,
+  ),
 };
 
 if (!CONFIG.telegramToken) {
@@ -1015,23 +1019,56 @@ async function cleanupExpiredTorrentSessions() {
     state.awaitingCustomName.delete(chatId);
     await safeSendMessage(chatId, "⌛ Ajout annulé après 15 min d'inactivité.");
   }
+}
 
-  async function cleanupStaleTorrentUploads() {
-    const entries = await fs.readdir(os.tmpdir(), { withFileTypes: true });
-    await Promise.all(
-      entries
-        .filter(
-          (entry) =>
-            entry.isDirectory() && entry.name.startsWith("myplexmonitor-torrent-"),
-        )
-        .map((entry) =>
-          fs.rm(path.join(os.tmpdir(), entry.name), {
-            recursive: true,
-            force: true,
-          }),
-        ),
-    );
+async function cleanupStaleTorrentUploads() {
+  const entries = await fs.readdir(os.tmpdir(), { withFileTypes: true });
+  await Promise.all(
+    entries
+      .filter(
+        (entry) =>
+          entry.isDirectory() && entry.name.startsWith("myplexmonitor-torrent-"),
+      )
+      .map((entry) =>
+        fs.rm(path.join(os.tmpdir(), entry.name), {
+          recursive: true,
+          force: true,
+        }),
+      ),
+  );
+}
+
+async function downloadTelegramDocument(fileId, destinationPath, maxBytes) {
+  const fileUrl = await bot.getFileLink(fileId);
+  let lastError;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await axios.get(fileUrl, {
+        responseType: "arraybuffer",
+        timeout: CONFIG.telegramDownloadTimeoutMs,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        validateStatus: (status) => status >= 200 && status < 300,
+      });
+      const content = Buffer.from(response.data);
+      if (content.length > maxBytes) {
+        throw new Error("fichier téléchargé trop volumineux");
+      }
+      await fs.writeFile(destinationPath, content, { flag: "wx" });
+      return;
+    } catch (error) {
+      lastError = error;
+      await fs.rm(destinationPath, { force: true });
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
   }
+
+  throw new Error(
+    `téléchargement Telegram interrompu (${lastError?.message || "erreur inconnue"})`,
+  );
 }
 
 async function askMediaType(chatId) {
@@ -1631,15 +1668,15 @@ bot.on("message", async (msg) => {
     );
     const uploadedPath = path.join(
       uploadDirectory,
-      path.basename(msg.document.file_name),
+      path.basename(msg.document.file_name || "upload.torrent"),
     );
 
     try {
-      const downloadedPath = await bot.downloadFile(
+      await downloadTelegramDocument(
         msg.document.file_id,
-        uploadDirectory,
+        uploadedPath,
+        maxSize,
       );
-      await fs.rename(downloadedPath, uploadedPath);
       const downloadedStat = await fs.stat(uploadedPath);
       if (downloadedStat.size > maxSize) {
         throw new Error(
