@@ -40,8 +40,28 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
 - Sans argument sur `/pause`, `/resume`, `/delete`: affichage des torrents actionnables avec boutons Telegram
 - Alias lisibles `[T001]`, `[T002]`... utilisables directement dans les commandes
 - `/random` (film aléatoire depuis `MOVIES_PATH`)
-- `/movies [az|za|recent]` (liste triée)
+- `/movies [az|za|recent]` ouvre un catalogue interactif avec pagination et tri
+  A-Z, Z-A ou par date récente
+- `/search <titre>` recherche un film dans `MOVIES_PATH`; le bouton de recherche
+  du catalogue permet aussi une recherche guidée directement dans Telegram
+- Les boutons du catalogue ouvrent une fiche détaillée avec fichier, taille,
+  date de modification et format.
+- `/film [magnet|url]` propose un assistant rapide avec le dossier Films et
+  les options avancées uniquement sur demande.
+- `/status` affiche le tableau de bord Plex, qBittorrent, vitesse et disque.
+- `/notifications` permet d'activer ou désactiver les notifications de fin de
+  téléchargement et les alertes Plex/qBittorrent pour le chat courant.
 - `/export_torrents` (export CSV des torrents)
+
+### C411
+
+Le guide C411 fourni documente les identifiants de catégories et d'options,
+notamment la catégorie Film (`subcategoryId=6`) et Série TV (`subcategoryId=8`).
+Le fichier fourni ne contient toutefois pas les routes de recherche,
+l'authentification ou le format de téléchargement. Le bot réserve donc
+`C411_API_URL` et `C411_API_KEY` dans `.env`, mais n'appelle pas encore de route
+non vérifiée. Il faudra le guide API/authentification complet pour ajouter une
+recherche C411 fiable sans exposer de clé ni casser le bot.
 
 ### Diagnostic Ubuntu (LOCAL)
 - Rapport de démarrage (uptime, loadavg, RAM, analyse `last -x`).

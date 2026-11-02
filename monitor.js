@@ -231,7 +231,11 @@ const state = {
   torrentUploads: new Map(),
   awaitingCustomPath: new Set(),
   awaitingCustomName: new Set(),
+  awaitingMovieSearch: new Set(),
+  awaitingQuickTorrent: new Map(),
   downloadsView: new Map(),
+  movieCatalogView: new Map(),
+  notificationPreferences: new Map(),
   qbitSid: null,
   torrentAliasesByHash: new Map(),
   torrentHashesByAlias: new Map(),
@@ -239,6 +243,25 @@ const state = {
   trackedTorrents: new Map(),
   lastQbitErrorAlertAt: 0,
 };
+
+const NOTIFICATION_TYPES = {
+  completion: "Téléchargements terminés",
+  system: "Plex et qBittorrent",
+};
+
+function getNotificationPreferences(chatId) {
+  if (!state.notificationPreferences.has(String(chatId))) {
+    state.notificationPreferences.set(String(chatId), {
+      completion: true,
+      system: true,
+    });
+  }
+  return state.notificationPreferences.get(String(chatId));
+}
+
+function isNotificationEnabled(chatId, type) {
+  return getNotificationPreferences(chatId)[type] !== false;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilitaires généraux
@@ -381,6 +404,9 @@ async function safeSendMessage(chatId, text, options = {}) {
 }
 
 async function sendAlert(text, options = {}) {
+  const notificationType = options.notificationType || "system";
+  const messageOptions = { ...options };
+  delete messageOptions.notificationType;
   const recipients =
     CONFIG.telegramChatIds.length > 0
       ? CONFIG.telegramChatIds
@@ -390,8 +416,16 @@ async function sendAlert(text, options = {}) {
     return;
   }
   await Promise.all(
-    recipients.map((chatId) => safeSendMessage(chatId, text, options)),
+    recipients
+      .filter((chatId) => isNotificationEnabled(chatId, notificationType))
+      .map((chatId) => safeSendMessage(chatId, text, messageOptions)),
   );
+}
+
+async function sendCompletionNotification(chatId, text, options = {}) {
+  if (isNotificationEnabled(chatId, "completion")) {
+    await safeSendMessage(chatId, text, options);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1097,6 +1131,7 @@ async function buildMoviesCatalog(rootPath, options = {}) {
 
       videos.push({
         fileName: entry.name,
+        directory: currentPath,
         simpleName: simplifyTorrentName(entry.name.replace(extension, "")),
         updatedAt: stat.mtimeMs || 0,
       });
@@ -1104,6 +1139,121 @@ async function buildMoviesCatalog(rootPath, options = {}) {
   }
 
   return videos;
+}
+
+async function renderMovieCatalog(chatId, options = {}) {
+  const previous = state.movieCatalogView.get(chatId) || {};
+  const sort = options.sort || previous.sort || "az";
+  const query = (options.query ?? previous.query ?? "").trim();
+  const page = options.page ?? previous.page ?? 0;
+  const movies = await buildMoviesCatalog(CONFIG.qbit.pathMovie, {
+    maxResults: 1000,
+    maxDepth: 4,
+  });
+  const filtered = query
+    ? movies.filter((movie) =>
+        movie.simpleName.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")),
+      )
+    : movies;
+
+  if (sort === "recent") {
+    filtered.sort((a, b) => b.updatedAt - a.updatedAt);
+  } else if (sort === "za") {
+    filtered.sort((a, b) => b.simpleName.localeCompare(a.simpleName, "fr"));
+  } else {
+    filtered.sort((a, b) => a.simpleName.localeCompare(b.simpleName, "fr"));
+  }
+
+  const pageSize = 8;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const items = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  state.movieCatalogView.set(chatId, { sort, query, page: safePage });
+
+  const title = query ? `🔎 Films : « ${query} »` : "🎬 Bibliothèque de films";
+  const lines = [
+    `*${title}*`,
+    `${filtered.length} résultat(s) · page ${safePage + 1}/${totalPages}`,
+    "",
+    ...(items.length
+      ? items.map((movie, index) => `${safePage * pageSize + index + 1}. ${movie.simpleName}`)
+      : ["Aucun film trouvé."]),
+  ];
+  const keyboard = [
+    [
+      { text: "🔤 A-Z", callback_data: "mc:sort:az" },
+      { text: "🔤 Z-A", callback_data: "mc:sort:za" },
+      { text: "🕘 Récents", callback_data: "mc:sort:recent" },
+    ],
+    [
+      { text: "🔎 Rechercher", callback_data: "mc:search" },
+      { text: "🔄 Actualiser", callback_data: "mc:refresh" },
+    ],
+    [
+      { text: "⬅️", callback_data: "mc:page:prev" },
+      { text: `Page ${safePage + 1}/${totalPages}`, callback_data: "mc:noop" },
+      { text: "➡️", callback_data: "mc:page:next" },
+    ],
+    ...items.map((movie, index) => [
+      {
+        text: `🎬 ${movie.simpleName.slice(0, 38)}`,
+        callback_data: `mc:item:${safePage * pageSize + index}`,
+      },
+    ]),
+    [{ text: "🏠 Menu", callback_data: "menu:home" }],
+  ];
+  const messageOptions = {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: keyboard },
+  };
+  if (options.editMeta) {
+    await bot.editMessageText(lines.join("\n"), {
+      chat_id: options.editMeta.chatId,
+      message_id: options.editMeta.messageId,
+      ...messageOptions,
+    });
+  } else {
+    await safeSendMessage(chatId, lines.join("\n"), messageOptions);
+  }
+}
+
+async function renderMovieDetails(chatId, movie, editMeta = null) {
+  const extension = path.extname(movie.fileName);
+  const fullPath = path.join(movie.directory, movie.fileName);
+  let size = "inconnue";
+  try {
+    size = formatBytes((await fs.stat(fullPath)).size);
+  } catch (error) {
+    logInfo(`⚠️ Taille du film indisponible: ${error.message}`);
+  }
+  const text = [
+    `🎬 *${movie.simpleName}*`,
+    "",
+    `📁 Fichier: \`${movie.fileName}\``,
+    `💾 Taille: ${size}`,
+    `🗓️ Modifié: ${new Date(movie.updatedAt).toLocaleDateString("fr-FR")}`,
+    `📦 Format: ${extension.replace(".", "").toUpperCase() || "inconnu"}`,
+  ].join("\n");
+  const options = {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "⬅️ Retour aux films", callback_data: "mc:back" },
+          { text: "🏠 Menu", callback_data: "menu:home" },
+        ],
+      ],
+    },
+  };
+  if (editMeta) {
+    await bot.editMessageText(text, {
+      chat_id: editMeta.chatId,
+      message_id: editMeta.messageId,
+      ...options,
+    });
+  } else {
+    await safeSendMessage(chatId, text, options);
+  }
 }
 
 function toCsvLine(values) {
@@ -1176,6 +1326,7 @@ async function cleanupExpiredTorrentSessions() {
     if (now - (session.updatedAt || now) <= expirationMs) continue;
     await cleanupTorrentSource(session);
     state.torrentSessions.delete(chatId);
+    state.awaitingQuickTorrent.delete(chatId);
     state.awaitingCustomPath.delete(chatId);
     state.awaitingCustomName.delete(chatId);
     await safeSendMessage(chatId, "⌛ Ajout annulé après 15 min d'inactivité.");
@@ -1453,6 +1604,92 @@ async function sendDiskUsage(chatId) {
   await safeSendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" });
 }
 
+async function renderDashboard(chatId, editMeta = null) {
+  const [plex, qbitResult] = await Promise.all([
+    pingServer(),
+    listTorrents("all")
+      .then((torrents) => ({ torrents, error: null }))
+      .catch((error) => ({ torrents: [], error })),
+  ]);
+  const torrents = qbitResult.torrents;
+  const active = torrents.filter((torrent) =>
+    ["downloading", "stalledDL", "metaDL", "forcedDL"].includes(torrent.state),
+  );
+  const speed = active.reduce((total, torrent) => total + (torrent.dlspeed || 0), 0);
+  let disk = "indisponible";
+  try {
+    disk = (await getDiskUsage(CONFIG.qbit.pathMovie)).available;
+  } catch (error) {
+    logInfo(`⚠️ Espace disque du tableau de bord indisponible: ${error.message}`);
+  }
+  const text = [
+    "📊 *Tableau de bord*",
+    "",
+    `Plex: ${plex.online ? "🟢 En ligne" : "🔴 Hors ligne"}`,
+    qbitResult.error
+      ? `qBittorrent: 🔴 Indisponible (${qbitResult.error.message})`
+      : `qBittorrent: 🟢 Connecté\nTéléchargements actifs: *${active.length}*\nVitesse totale: *${formatBytes(speed)}/s*`,
+    `Espace libre Films: *${disk}*`,
+    `Dernière mise à jour: ${getFormattedDate()}`,
+  ].join("\n");
+  const options = {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔄 Actualiser", callback_data: "dash:refresh" },
+          { text: "📥 Torrents", callback_data: "menu:downloads" },
+        ],
+        [
+          { text: "🎬 Films", callback_data: "menu:movies" },
+          { text: "💾 Disque", callback_data: "menu:disk" },
+        ],
+        [{ text: "🏠 Menu", callback_data: "menu:home" }],
+      ],
+    },
+  };
+  if (editMeta) {
+    await bot.editMessageText(text, {
+      chat_id: editMeta.chatId,
+      message_id: editMeta.messageId,
+      ...options,
+    });
+  } else {
+    await safeSendMessage(chatId, text, options);
+  }
+}
+
+async function renderNotificationSettings(chatId, editMeta = null) {
+  const preferences = getNotificationPreferences(chatId);
+  const text = [
+    "🔔 *Notifications*",
+    "",
+    `${preferences.completion ? "✅" : "❌"} Téléchargements terminés`,
+    `${preferences.system ? "✅" : "❌"} Plex et qBittorrent`,
+    "",
+    "Les réglages sont appliqués immédiatement pour ce chat.",
+  ].join("\n");
+  const options = {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `${preferences.completion ? "🔕" : "🔔"} Téléchargements`, callback_data: "notif:toggle:completion" }],
+        [{ text: `${preferences.system ? "🔕" : "🔔"} Plex/qBittorrent`, callback_data: "notif:toggle:system" }],
+        [{ text: "🏠 Menu", callback_data: "menu:home" }],
+      ],
+    },
+  };
+  if (editMeta) {
+    await bot.editMessageText(text, {
+      chat_id: editMeta.chatId,
+      message_id: editMeta.messageId,
+      ...options,
+    });
+  } else {
+    await safeSendMessage(chatId, text, options);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Commandes Telegram
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1472,6 +1709,14 @@ bot.onText(/\/start/, async (msg) => {
             ],
             [
               { text: "📥 Téléchargements", callback_data: "menu:downloads" },
+              { text: "🎬 Films", callback_data: "menu:movies" },
+            ],
+            [
+              { text: "💾 Espace disque", callback_data: "menu:disk" },
+              { text: "📊 Tableau de bord", callback_data: "menu:dashboard" },
+            ],
+            [
+              { text: "🔔 Notifications", callback_data: "menu:notifications" },
               { text: "❓ Aide", callback_data: "menu:help" },
             ],
           ],
@@ -1492,9 +1737,45 @@ bot.onText(/\/cancel/i, async (msg) => {
     const session = state.torrentSessions.get(chatId);
     await cleanupTorrentSource(session);
     state.torrentSessions.delete(chatId);
+    state.awaitingQuickTorrent.delete(chatId);
     state.awaitingCustomPath.delete(chatId);
     state.awaitingCustomName.delete(chatId);
+    state.awaitingMovieSearch.delete(chatId);
     await safeSendMessage(chatId, "❌ Annulé.");
+  });
+
+  bot.onText(/\/film(?:\s+(.+))?/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+      const source = (match?.[1] || "").trim();
+      if (!source) {
+        state.awaitingQuickTorrent.set(chatId, "movie");
+        await safeSendMessage(chatId, "🎬 Envoie maintenant le lien magnet ou l’URL du torrent.", {
+          reply_markup: { force_reply: true },
+        });
+        return;
+      }
+      initializeTorrentSession(chatId, source, "movie");
+      await askConfirmation(chatId, state.torrentSessions.get(chatId));
+    });
+  });
+
+  bot.onText(/\/status/i, async (msg) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+      try {
+        await renderDashboard(chatId);
+      } catch (error) {
+        await safeSendMessage(chatId, `❌ Tableau de bord indisponible: ${error.message}`);
+      }
+    });
+  });
+
+  bot.onText(/\/notifications/i, async (msg) => {
+    const chatId = msg.chat.id;
+    await withAuthorizedChat(chatId, async () => {
+      await renderNotificationSettings(chatId);
+    });
   });
 });
 
@@ -1513,6 +1794,11 @@ bot.onText(/\/help/, async (msg) => {
       "- /movie <magnet|url>",
       "- /series <magnet|url>",
       "- /downloads [all|active|paused|completed]",
+      "- /movies [az|za|recent] (catalogue interactif)",
+      "- /search <titre> (chercher un film)",
+      "- /film [magnet|url] (assistant rapide)",
+      "- /status (tableau de bord)",
+      "- /notifications (préférences d'alertes)",
       "- /pause [id|nom] (sans argument: bouton de sélection)",
       "- /resume [id|nom] (sans argument: bouton de sélection)",
       "- /delete [id|nom] (sans argument: bouton de sélection)",
@@ -1771,41 +2057,30 @@ bot.onText(/\/movies(?:\s+(\S+))?/i, async (msg, match) => {
   await withAuthorizedChat(chatId, async () => {
     const mode = (match?.[1] || "az").toLowerCase();
     try {
-      const movies = await buildMoviesCatalog(CONFIG.qbit.pathMovie, {
-        maxResults: 500,
-        maxDepth: 4,
-      });
-      if (movies.length === 0) {
-        await safeSendMessage(
-          chatId,
-          "ℹ️ Aucun film trouvé dans le dossier MOVIES_PATH.",
-        );
-        return;
-      }
-
-      if (mode === "recent") {
-        movies.sort((a, b) => b.updatedAt - a.updatedAt);
-      } else if (mode === "za") {
-        movies.sort((a, b) => b.simpleName.localeCompare(a.simpleName, "fr"));
-      } else {
-        movies.sort((a, b) => a.simpleName.localeCompare(b.simpleName, "fr"));
-      }
-
-      const preview = movies.slice(0, 30);
-      const lines = [
-        `🎬 Liste films (${mode})`,
-        ...preview.map((movie, index) => `${index + 1}. ${movie.simpleName}`),
-      ];
-
-      if (movies.length > preview.length) {
-        lines.push(
-          `… ${movies.length - preview.length} film(s) supplémentaire(s).`,
-        );
-      }
-
-      await safeSendMessage(chatId, lines.join("\n"));
+    await renderMovieCatalog(chatId, {
+      sort: ["az", "za", "recent"].includes(mode) ? mode : "az",
+    });
     } catch (error) {
-      await safeSendMessage(chatId, `❌ /movies: ${error.message}`);
+    await safeSendMessage(chatId, `❌ /movies: ${error.message}`);
+    }
+  });
+});
+
+bot.onText(/\/search(?:\s+(.+))?/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  await withAuthorizedChat(chatId, async () => {
+    const query = (match?.[1] || "").trim();
+    if (!query) {
+    state.awaitingMovieSearch.add(chatId);
+    await safeSendMessage(chatId, "🔎 Quel film cherches-tu ?", {
+      reply_markup: { force_reply: true },
+    });
+    return;
+    }
+    try {
+    await renderMovieCatalog(chatId, { query, page: 0 });
+    } catch (error) {
+    await safeSendMessage(chatId, `❌ /search: ${error.message}`);
     }
   });
 });
@@ -1964,6 +2239,24 @@ bot.on("message", async (msg) => {
 
   if (!msg.text || msg.text.startsWith("/")) return;
 
+  if (state.awaitingQuickTorrent.has(chatId)) {
+    const mediaType = state.awaitingQuickTorrent.get(chatId);
+    state.awaitingQuickTorrent.delete(chatId);
+    initializeTorrentSession(chatId, msg.text.trim(), mediaType);
+    await askConfirmation(chatId, state.torrentSessions.get(chatId));
+    return;
+  }
+
+  if (state.awaitingMovieSearch.has(chatId)) {
+    state.awaitingMovieSearch.delete(chatId);
+    try {
+      await renderMovieCatalog(chatId, { query: msg.text, page: 0 });
+    } catch (error) {
+      await safeSendMessage(chatId, `❌ Recherche impossible: ${error.message}`);
+    }
+    return;
+  }
+
   if (state.awaitingCustomName.has(chatId)) {
     const session = state.torrentSessions.get(chatId);
     if (!session) {
@@ -2025,15 +2318,75 @@ bot.on("callback_query", async (query) => {
     }
 
     if (data === "menu:movie" || data === "menu:series") {
-      const command = data.endsWith("movie") ? "/movie" : "/series";
+      const mediaType = data.endsWith("movie") ? "movie" : "series";
+      const label = mediaType === "movie" ? "🎬 film" : "📺 série";
+      state.awaitingQuickTorrent.set(chatId, mediaType);
       await safeSendMessage(
         chatId,
-        `Envoie ${command} suivi du lien magnet ou URL du torrent.`,
+        `Envoie le lien magnet ou l’URL du torrent pour ${label}.`,
+        { reply_markup: { force_reply: true } },
       );
       return;
     }
     if (data === "menu:downloads") {
       await renderDownloads(chatId);
+      return;
+    }
+    if (data === "menu:movies") {
+      await renderMovieCatalog(chatId);
+      return;
+    }
+    if (data === "menu:disk") {
+      await sendDiskUsage(chatId);
+      return;
+    }
+    if (data === "menu:dashboard") {
+      await renderDashboard(chatId);
+      return;
+    }
+    if (data === "menu:notifications") {
+      await renderNotificationSettings(chatId);
+      return;
+    }
+    if (data === "menu:home") {
+      state.awaitingQuickTorrent.delete(chatId);
+      state.awaitingMovieSearch.delete(chatId);
+      await safeSendMessage(chatId, "🏠 Menu principal :", {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🎬 Ajouter un film", callback_data: "menu:movie" },
+              { text: "📺 Ajouter une série", callback_data: "menu:series" },
+            ],
+            [
+              { text: "📥 Téléchargements", callback_data: "menu:downloads" },
+              { text: "🎬 Films", callback_data: "menu:movies" },
+            ],
+            [
+              { text: "💾 Espace disque", callback_data: "menu:disk" },
+              { text: "📊 Tableau de bord", callback_data: "menu:dashboard" },
+            ],
+            [
+              { text: "🔔 Notifications", callback_data: "menu:notifications" },
+              { text: "❓ Aide", callback_data: "menu:help" },
+            ],
+          ],
+        },
+      });
+      return;
+    }
+
+    if (data.startsWith("notif:toggle:")) {
+      const type = data.split(":")[2];
+      if (!NOTIFICATION_TYPES[type]) return;
+      const preferences = getNotificationPreferences(chatId);
+      preferences[type] = !preferences[type];
+      await renderNotificationSettings(chatId, { chatId, messageId });
+      return;
+    }
+
+    if (data === "dash:refresh") {
+      await renderDashboard(chatId, { chatId, messageId });
       return;
     }
     if (data === "menu:help") {
@@ -2258,6 +2611,74 @@ bot.on("callback_query", async (query) => {
       }
     }
 
+    if (data.startsWith("mc:")) {
+      const view = state.movieCatalogView.get(chatId) || {
+        sort: "az",
+        query: "",
+        page: 0,
+      };
+      if (data === "mc:noop") return;
+      if (data === "mc:back") {
+        await renderMovieCatalog(chatId, { editMeta: { chatId, messageId } });
+        return;
+      }
+      if (data.startsWith("mc:item:")) {
+        const index = Number.parseInt(data.split(":")[2], 10);
+        const catalog = await buildMoviesCatalog(CONFIG.qbit.pathMovie, {
+          maxResults: 1000,
+          maxDepth: 4,
+        });
+        const sorted = catalog
+          .filter((movie) =>
+            view.query
+              ? movie.simpleName.toLocaleLowerCase("fr").includes(view.query.toLocaleLowerCase("fr"))
+              : true,
+          )
+          .sort((a, b) =>
+            view.sort === "recent"
+              ? b.updatedAt - a.updatedAt
+              : view.sort === "za"
+                ? b.simpleName.localeCompare(a.simpleName, "fr")
+                : a.simpleName.localeCompare(b.simpleName, "fr"),
+          );
+        if (sorted[index]) {
+          await renderMovieDetails(chatId, sorted[index], { chatId, messageId });
+        }
+        return;
+      }
+      if (data === "mc:search") {
+        state.awaitingMovieSearch.add(chatId);
+        await safeSendMessage(chatId, "🔎 Quel film cherches-tu ?", {
+          reply_markup: { force_reply: true },
+        });
+        return;
+      }
+      if (data === "mc:refresh") {
+        await renderMovieCatalog(chatId, {
+          ...view,
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data.startsWith("mc:sort:")) {
+        await renderMovieCatalog(chatId, {
+          ...view,
+          sort: data.split(":")[2],
+          page: 0,
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data === "mc:page:next" || data === "mc:page:prev") {
+        await renderMovieCatalog(chatId, {
+          ...view,
+          page: view.page + (data.endsWith("next") ? 1 : -1),
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+    }
+
     if (data.startsWith("ta:")) {
       const [, action, hash] = data.split(":");
       if (!action || !hash) return;
@@ -2321,7 +2742,7 @@ async function checkTorrentCompletions() {
               : [CONFIG.telegramChatId].filter(Boolean);
 
           for (const chatId of recipients) {
-            await safeSendMessage(
+            await sendCompletionNotification(
               chatId,
               `✅ *Téléchargement terminé:*
 ${torrent.name}
@@ -2329,7 +2750,7 @@ ${torrent.name}
 _Nom d'origine: ${oldName}_`,
               {
                 parse_mode: "Markdown",
-              }
+              },
             );
           }
         } catch(renameError) {
@@ -2382,7 +2803,12 @@ _Nom d'origine: ${oldName}_`,
       { command: "movie", description: "Ajouter un film" },
       { command: "series", description: "Ajouter une série" },
       { command: "torrent", description: "Ajouter un torrent" },
+      { command: "film", description: "Assistant rapide pour un film" },
       { command: "downloads", description: "Voir les téléchargements" },
+      { command: "movies", description: "Parcourir la bibliothèque de films" },
+      { command: "search", description: "Rechercher un film" },
+      { command: "status", description: "Tableau de bord serveur" },
+      { command: "notifications", description: "Gérer les notifications" },
       { command: "disk", description: "Voir l'espace disque disponible" },
       { command: "cancel", description: "Annuler l'action en cours" },
       { command: "help", description: "Afficher l'aide" },
