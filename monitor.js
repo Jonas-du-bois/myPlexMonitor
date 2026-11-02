@@ -73,20 +73,20 @@ Nom de fichier brut à analyser: "${rawName}"
        return simplifyTorrentName(rawName);
     }
 
-    function getTorrentSourceName(source) {
-      if (!source) return "torrent";
-      if (source.startsWith("magnet:")) {
-        const displayName = source.match(/[?&]dn=([^&]+)/i)?.[1];
-        return displayName ? decodeURIComponent(displayName) : "torrent";
-      }
-      return path.basename(source).replace(/\.torrent$/i, "");
-    }
-
     return formattedName;
   } catch (error) {
     logInfo(`⚠️ Erreur Gemini API: ${error.message}`);
     return simplifyTorrentName(rawName); // fallback
   }
+}
+
+function getTorrentSourceName(source) {
+  if (!source) return "torrent";
+  if (source.startsWith("magnet:")) {
+    const displayName = source.match(/[?&]dn=([^&]+)/i)?.[1];
+    return displayName ? decodeURIComponent(displayName) : "torrent";
+  }
+  return path.basename(source).replace(/\.torrent$/i, "");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1039,11 +1039,22 @@ async function cleanupStaleTorrentUploads() {
 }
 
 async function downloadTelegramDocument(fileId, destinationPath, maxBytes) {
-  const fileUrl = await bot.getFileLink(fileId);
   let lastError;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      const fileResponse = await axios.get(
+        `https://api.telegram.org/bot${CONFIG.telegramToken}/getFile`,
+        {
+          params: { file_id: fileId },
+          timeout: CONFIG.telegramDownloadTimeoutMs,
+        },
+      );
+      const filePath = fileResponse.data?.result?.file_path;
+      if (!filePath) {
+        throw new Error("Telegram n'a pas retourné le chemin du fichier");
+      }
+      const fileUrl = `https://api.telegram.org/file/bot${CONFIG.telegramToken}/${filePath}`;
       const response = await axios.get(fileUrl, {
         responseType: "arraybuffer",
         timeout: CONFIG.telegramDownloadTimeoutMs,
@@ -1643,35 +1654,41 @@ bot.onText(/\/export_torrents/i, async (msg) => {
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  if (!isChatAuthorized(chatId)) return;
+  if (!isChatAuthorized(chatId)) {
+    await denyUnauthorized(chatId);
+    logInfo(`⚠️ Document/message refusé pour le chat ${chatId}`);
+    return;
+  }
 
   if (msg.document) {
-    const isTorrent =
-      msg.document.file_name?.toLowerCase().endsWith(".torrent") ||
-      msg.document.mime_type === "application/x-bittorrent";
-    if (!isTorrent) {
-      await safeSendMessage(chatId, "❌ Le fichier doit avoir l'extension .torrent.");
-      return;
-    }
-
-    const maxSize = CONFIG.qbit.maxTorrentFileSizeMb * 1024 * 1024;
-    if (msg.document.file_size && msg.document.file_size > maxSize) {
-      await safeSendMessage(
-        chatId,
-        `❌ Fichier trop volumineux (maximum ${CONFIG.qbit.maxTorrentFileSizeMb} Mo).`,
-      );
-      return;
-    }
-
-    const uploadDirectory = await fs.mkdtemp(
-      path.join(os.tmpdir(), "myplexmonitor-torrent-"),
-    );
-    const uploadedPath = path.join(
-      uploadDirectory,
-      path.basename(msg.document.file_name || "upload.torrent"),
-    );
-
+    let uploadDirectory = null;
+    let keepUpload = false;
     try {
+      const isTorrent =
+        msg.document.file_name?.toLowerCase().endsWith(".torrent") ||
+        msg.document.mime_type === "application/x-bittorrent";
+      if (!isTorrent) {
+        await safeSendMessage(chatId, "❌ Envoie un fichier .torrent.");
+        return;
+      }
+
+      const maxSize = CONFIG.qbit.maxTorrentFileSizeMb * 1024 * 1024;
+      if (msg.document.file_size && msg.document.file_size > maxSize) {
+        await safeSendMessage(
+          chatId,
+          `❌ Fichier trop volumineux (maximum ${CONFIG.qbit.maxTorrentFileSizeMb} Mo).`,
+        );
+        return;
+      }
+
+      await safeSendMessage(chatId, "⏳ Réception du fichier torrent…");
+      uploadDirectory = await fs.mkdtemp(
+        path.join(os.tmpdir(), "myplexmonitor-torrent-"),
+      );
+      const uploadedPath = path.join(
+        uploadDirectory,
+        path.basename(msg.document.file_name || "upload.torrent"),
+      );
       await downloadTelegramDocument(
         msg.document.file_id,
         uploadedPath,
@@ -1684,13 +1701,18 @@ bot.on("message", async (msg) => {
         );
       }
       initializeTorrentSession(chatId, uploadedPath, "movie", "file");
+      keepUpload = true;
       await askMediaType(chatId);
     } catch (error) {
+      logInfo(`❌ Upload Telegram échoué: ${error.message}`);
       await safeSendMessage(
         chatId,
         `❌ Impossible de télécharger le fichier torrent: ${error.message}`,
       );
-      await fs.rm(uploadDirectory, { recursive: true, force: true });
+    } finally {
+      if (uploadDirectory && !keepUpload) {
+        await fs.rm(uploadDirectory, { recursive: true, force: true });
+      }
     }
     return;
   }
@@ -1729,7 +1751,15 @@ bot.on("callback_query", async (query) => {
   const data = query.data;
 
   if (!chatId || !data) return;
-  if (!isChatAuthorized(chatId)) return;
+  if (!isChatAuthorized(chatId)) {
+    await bot
+      .answerCallbackQuery(query.id, {
+        text: "Accès refusé",
+        show_alert: true,
+      })
+      .catch(() => null);
+    return;
+  }
 
   await bot.answerCallbackQuery(query.id).catch(() => null);
 
@@ -2082,7 +2112,11 @@ _Nom d'origine: ${oldName}_`,
 // Démarrage
 // ─────────────────────────────────────────────────────────────────────────────
 (async () => {
-  logInfo(`🚀 MyPlexMonitor démarré en mode ${CONFIG.role}.`);
+  logInfo(
+    `🚀 MyPlexMonitor démarré en mode ${CONFIG.role} (polling Telegram: ${
+      CONFIG.role === "LOCAL" ? "actif" : "en attente d'un failover"
+    }).`,
+  );
   await cleanupStaleTorrentUploads().catch((error) =>
     logInfo(`⚠️ Nettoyage temporaire impossible: ${error.message}`),
   );
