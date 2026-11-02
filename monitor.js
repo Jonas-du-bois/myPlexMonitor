@@ -9,10 +9,11 @@ const os = require("os");
 const fs = require("fs/promises");
 const crypto = require("crypto");
 const path = require("path");
-const { exec } = require("child_process");
+const { exec, execFile } = require("child_process");
 const { promisify } = require("util");
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1357,6 +1358,69 @@ async function renderDownloads(
   });
 }
 
+async function getDiskUsage(targetPath) {
+  const { stdout } = await execFileAsync("df", ["-P", "-h", targetPath]);
+  const lines = stdout.trim().split("\n");
+  if (lines.length < 2) {
+    throw new Error(`aucune information disque pour ${targetPath}`);
+  }
+
+  const parts = lines[lines.length - 1].split(/\s+/);
+  if (parts.length < 6) {
+    throw new Error(`réponse df invalide pour ${targetPath}`);
+  }
+
+  return {
+    path: targetPath,
+    total: parts[1],
+    used: parts[2],
+    available: parts[3],
+    usage: parts[4],
+  };
+}
+
+async function sendDiskUsage(chatId) {
+  const paths = [
+    ["🎬 Films", CONFIG.qbit.pathMovie],
+    ["📺 Séries", CONFIG.qbit.pathSeries],
+    ["📦 Autre", CONFIG.qbit.pathOther],
+  ];
+  const uniquePaths = [
+    ...new Map(paths.map(([, targetPath]) => [targetPath, targetPath])).values(),
+  ];
+  const results = await Promise.all(
+    uniquePaths.map(async (targetPath) => {
+      try {
+        return { usage: await getDiskUsage(targetPath) };
+      } catch (error) {
+        return { targetPath, error };
+      }
+    }),
+  );
+  const labelsByPath = new Map(
+    paths.map(([label, targetPath]) => [targetPath, label]),
+  );
+  const lines = ["💾 *Espace disque*"];
+
+  for (const result of results) {
+    if (result.error) {
+      lines.push(
+        `❌ ${labelsByPath.get(result.targetPath)}: ${result.error.message}`,
+      );
+      continue;
+    }
+
+    const { usage } = result;
+    lines.push(
+      `${labelsByPath.get(usage.path)}: *${usage.available} libres* / ${usage.total} (${usage.usage} utilisés)`,
+      `└ \`${usage.path}\``,
+    );
+  }
+
+  lines.push("", "Utilise /disk pour actualiser.");
+  await safeSendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Commandes Telegram
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1714,37 +1778,16 @@ bot.onText(/\/movies(?:\s+(\S+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/disk/i, async (msg) => {
+bot.onText(/\/(?:disk|space|storage)(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     try {
-      const pathToCheck = CONFIG.qbit.pathMovie || "/mnt/films";
-      const { stdout } = await execAsync(`df -h ${pathToCheck}`);
-      const lines = stdout.trim().split("\n");
-
-      if (lines.length > 1) {
-        const parts = lines[1].split(/\s+/);
-        const size = parts[1];
-        const used = parts[2];
-        const avail = parts[3];
-        const usePercent = parts[4];
-
-        const message = [
-          "💾 *Espace Disque*",
-          "📍 Dossier: `" + pathToCheck + "`",
-          "Total: `" + size + "`",
-          "Utilisé: `" + used + "` (" + usePercent + ")",
-          "Libre: `" + avail + "`",
-        ].join("\n");
-
-        await safeSendMessage(chatId, message, { parse_mode: "Markdown" });
-      } else {
-        await safeSendMessage(chatId, "⚠️ Impossible de lire l'espace disque.");
-      }
+      await safeSendMessage(chatId, "🔎 Vérification de l'espace disque…");
+      await sendDiskUsage(chatId);
     } catch (error) {
       await safeSendMessage(
         chatId,
-        "❌ Erreur espace disque: " + error.message,
+        `❌ Impossible de vérifier l'espace disque: ${error.message}`,
       );
     }
   });
@@ -2308,6 +2351,7 @@ _Nom d'origine: ${oldName}_`,
       { command: "series", description: "Ajouter une série" },
       { command: "torrent", description: "Ajouter un torrent" },
       { command: "downloads", description: "Voir les téléchargements" },
+      { command: "disk", description: "Voir l'espace disque disponible" },
       { command: "cancel", description: "Annuler l'action en cours" },
       { command: "help", description: "Afficher l'aide" },
     ])

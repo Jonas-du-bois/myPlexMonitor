@@ -33,6 +33,7 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
 - Le bouton de renommage intelligent utilise Gemini Flash via Google AI Studio
   (`GEMINI_API_KEY`) et revient à un nettoyage local si l'API est indisponible.
 - `/downloads [all|active|paused|completed]`
+- `/disk` (ou `/space`) pour voir l'espace libre des dossiers Films, Séries et Autre
 - `/pause [id|nom]`, `/resume [id|nom]`, `/delete [id|nom]`
 - Sans argument sur `/pause`, `/resume`, `/delete`: affichage des torrents actionnables avec boutons Telegram
 - Alias lisibles `[T001]`, `[T002]`... utilisables directement dans les commandes
