@@ -5,9 +5,9 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const { GoogleGenAI } = require("@google/genai");
-const FormData = require("form-data");
 const os = require("os");
 const fs = require("fs/promises");
+const crypto = require("crypto");
 const path = require("path");
 const { exec } = require("child_process");
 const { promisify } = require("util");
@@ -108,6 +108,10 @@ const CONFIG = {
     pathMovie: process.env.MOVIES_PATH || "/mnt/films",
     pathSeries: process.env.SERIES_PATH || "/mnt/films/series",
     pathOther: process.env.OTHER_PATH || "/mnt/films/downloads",
+    maxTorrentFileSizeMb: parseIntEnv(
+      process.env.MAX_TORRENT_FILE_SIZE_MB,
+      20,
+    ),
   },
 };
 
@@ -578,6 +582,55 @@ async function qbitRequest(path, method = "GET", data = null, retry = true) {
   }
 }
 
+async function qbitMultipartRequest(filePath, options, retry = true) {
+  try {
+    if (!state.qbitSid) {
+      await qbitLogin();
+    }
+
+    const boundary = `--------------------------${crypto.randomBytes(12).toString("hex")}`;
+    const fields = {
+      savepath: options.savePath,
+      category: options.category || "",
+      paused: options.startPaused ? "true" : "false",
+      autoTMM: "false",
+      ...(options.customName ? { rename: options.customName } : {}),
+    };
+    const parts = [];
+    for (const [name, value] of Object.entries(fields)) {
+      const safeValue = String(value).replace(/[\r\n]/g, " ");
+      parts.push(
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${safeValue}\r\n`,
+        ),
+      );
+    }
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="upload.torrent"\r\nContent-Type: application/x-bittorrent\r\n\r\n`,
+      ),
+      await fs.readFile(filePath),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    );
+
+    const response = await qbitHttp.post("/torrents/add", Buffer.concat(parts), {
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
+      },
+      maxBodyLength: Infinity,
+    });
+
+    return response.data;
+  } catch (error) {
+    if (retry && [401, 403].includes(error.response?.status || 0)) {
+      state.qbitSid = null;
+      return qbitMultipartRequest(filePath, options, false);
+    }
+    throw error;
+  }
+}
+
 async function listTorrents(filter = "all") {
   const torrents = await qbitRequest(
     `/torrents/info?filter=${encodeURIComponent(filter)}`,
@@ -587,73 +640,19 @@ async function listTorrents(filter = "all") {
 
 
 async function addTorrentWithOptions(options) {
-  const createPayload = () => {
-    if (options.fileBuffer) {
-      // Si c'est un fichier .torrent
-      const form = new FormData();
-      form.append("torrents", options.fileBuffer, {
-        filename: options.fileName || "download.torrent",
-        contentType: "application/x-bittorrent"
-      });
-      form.append("savepath", options.savePath);
-      if (options.category) form.append("category", options.category);
-      form.append("paused", options.startPaused ? "true" : "false");
-      form.append("autoTMM", "false");
-      if (options.customName) form.append("rename", options.customName);
-      return { payload: form, headers: form.getHeaders() };
-    }
-
-    // Si c'est un lien URL/Magnet
-    return {
-      payload: new URLSearchParams({
-        urls: options.source,
-        savepath: options.savePath,
-        category: options.category || "",
-        paused: options.startPaused ? "true" : "false",
-        autoTMM: "false",
-        ...(options.customName ? { rename: options.customName } : {}),
-      }).toString(),
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }
-    };
+  const payload = {
+    urls: options.source,
+    savepath: options.savePath,
+    category: options.category || "",
+    paused: options.startPaused ? "true" : "false",
+    autoTMM: "false",
+    ...(options.customName ? { rename: options.customName } : {}),
   };
 
-  // Effectuer la requête à qBittorrent
-  if (!state.qbitSid) {
-    await qbitLogin();
-  }
-
-  try {
-    const { payload, headers } = createPayload();
-    const config = {
-      method: 'POST',
-      url: `/torrents/add`,
-      data: payload,
-      headers: {
-        ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
-        ...headers
-      }
-    };
-
-    // On utilise directement l'instance axios qbitHttp car on veut modifier les headers
-    await qbitHttp.request(config);
-  } catch (error) {
-    if (error.response && (error.response.status === 403 || error.response.status === 401)) {
-       // retry login
-       await qbitLogin();
-       const { payload: retryPayload, headers: retryHeaders } = createPayload();
-       const retryConfig = {
-         method: 'POST',
-         url: `/torrents/add`,
-         data: retryPayload,
-         headers: {
-           ...(state.qbitSid ? { Cookie: state.qbitSid } : {}),
-           ...retryHeaders
-         }
-       };
-       await qbitHttp.request(retryConfig);
-    } else {
-       throw error;
-    }
+  if (options.sourceType === "file") {
+    await qbitMultipartRequest(options.source, options);
+  } else {
+    await qbitRequest("/torrents/add", "POST", payload);
   }
 
   if (options.priority && options.priority !== "normal") {
@@ -908,7 +907,12 @@ function toCsvLine(values) {
 // ─────────────────────────────────────────────────────────────────────────────
 // UI Telegram torrents
 // ─────────────────────────────────────────────────────────────────────────────
-function initializeTorrentSession(chatId, source, mediaType = "movie") {
+function initializeTorrentSession(
+  chatId,
+  source,
+  mediaType = "movie",
+  sourceType = "url",
+) {
   const defaults = {
     movie: {
       savePath: CONFIG.qbit.pathMovie,
@@ -928,6 +932,7 @@ function initializeTorrentSession(chatId, source, mediaType = "movie") {
 
   state.torrentSessions.set(chatId, {
     source,
+    sourceType,
     mediaType,
     savePath: selected.savePath,
     category: selected.category,
@@ -935,6 +940,11 @@ function initializeTorrentSession(chatId, source, mediaType = "movie") {
     startPaused: false,
     customName: null,
   });
+}
+
+async function cleanupTorrentSource(session) {
+  if (session?.sourceType !== "file") return;
+  await fs.rm(path.dirname(session.source), { recursive: true, force: true });
 }
 
 async function askMediaType(chatId) {
@@ -1536,44 +1546,53 @@ bot.onText(/\/export_torrents/i, async (msg) => {
   });
 });
 
-
-bot.on("document", async (msg) => {
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   if (!isChatAuthorized(chatId)) return;
 
-  const doc = msg.document;
-  if (!doc) return;
+  if (msg.document) {
+    if (!msg.document.file_name?.toLowerCase().endsWith(".torrent")) {
+      await safeSendMessage(chatId, "❌ Le fichier doit avoir l'extension .torrent.");
+      return;
+    }
 
-  if (!doc.file_name?.endsWith('.torrent') && doc.mime_type !== 'application/x-bittorrent') {
+    const maxSize = CONFIG.qbit.maxTorrentFileSizeMb * 1024 * 1024;
+    if (msg.document.file_size && msg.document.file_size > maxSize) {
+      await safeSendMessage(
+        chatId,
+        `❌ Fichier trop volumineux (maximum ${CONFIG.qbit.maxTorrentFileSizeMb} Mo).`,
+      );
+      return;
+    }
+
+    const uploadDirectory = await fs.mkdtemp(
+      path.join(os.tmpdir(), "myplexmonitor-torrent-"),
+    );
+    const uploadedPath = path.join(
+      uploadDirectory,
+      path.basename(msg.document.file_name),
+    );
+
+    try {
+      const downloadedPath = await bot.downloadFile(
+        msg.document.file_id,
+        uploadDirectory,
+      );
+      await fs.rename(downloadedPath, uploadedPath);
+      await fs.access(uploadedPath);
+      initializeTorrentSession(chatId, uploadedPath, "movie", "file");
+      await askMediaType(chatId);
+    } catch (error) {
+      await safeSendMessage(
+        chatId,
+        `❌ Impossible de télécharger le fichier torrent: ${error.message}`,
+      );
+      await fs.rm(uploadDirectory, { recursive: true, force: true });
+    }
     return;
   }
 
-  try {
-    const fileLink = await bot.getFileLink(doc.file_id);
-    const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
-    const buffer = Buffer.from(response.data);
-
-    // Initialiser une session avec le buffer
-    const source = doc.file_name; // On garde le nom original du fichier comme source
-    initializeTorrentSession(chatId, source, "movie"); // Par défaut, on va demander le type de toute façon
-
-    // On met à jour la session avec le buffer
-    const session = state.torrentSessions.get(chatId);
-    if (session) {
-      session.fileBuffer = buffer;
-      session.fileName = doc.file_name;
-    }
-
-    await askMediaType(chatId);
-  } catch (error) {
-    await safeSendMessage(chatId, `❌ Erreur lors du téléchargement du fichier torrent: ${error.message}`);
-  }
-});
-
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
   if (!msg.text || msg.text.startsWith("/")) return;
-  if (!isChatAuthorized(chatId)) return;
 
   if (state.awaitingCustomName.has(chatId)) {
     const session = state.torrentSessions.get(chatId);
@@ -1620,6 +1639,7 @@ bot.on("callback_query", async (query) => {
       }
 
       if (data === "tw:cancel") {
+        await cleanupTorrentSource(session);
         state.torrentSessions.delete(chatId);
         state.awaitingCustomPath.delete(chatId);
         await safeSendMessage(chatId, "❌ Ajout du torrent annulé.");
@@ -1628,8 +1648,13 @@ bot.on("callback_query", async (query) => {
 
       if (data.startsWith("tw:type:")) {
         const mediaType = data.split(":")[2];
-        initializeTorrentSession(chatId, session.source, mediaType);
-        await askPriority(chatId);
+        initializeTorrentSession(
+          chatId,
+          session.source,
+          mediaType,
+          session.sourceType,
+        );
+        await askSavePath(chatId);
         return;
       }
 
@@ -1748,9 +1773,6 @@ bot.on("callback_query", async (query) => {
       if (data === "tw:confirm") {
         try {
           await addTorrentWithOptions(session);
-          state.torrentSessions.delete(chatId);
-          state.awaitingCustomPath.delete(chatId);
-
           await safeSendMessage(chatId, "✅ Torrent ajouté avec succès.", {
             reply_markup: {
               inline_keyboard: [
@@ -1769,7 +1791,14 @@ bot.on("callback_query", async (query) => {
             },
           });
         } catch (error) {
-          await safeSendMessage(chatId, `❌ Erreur lors de l'ajout du torrent: ${error.message}`);
+          await safeSendMessage(
+            chatId,
+            `❌ Échec de l'ajout du torrent: ${error.message}`,
+          );
+        } finally {
+          await cleanupTorrentSource(session);
+          state.torrentSessions.delete(chatId);
+          state.awaitingCustomPath.delete(chatId);
         }
         return;
       }

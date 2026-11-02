@@ -27,6 +27,8 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
   - priorité (haute/normale/basse)
   - démarrage immédiat ou en pause
   - confirmation + actions rapides
+- Envoi direct d'un fichier `.torrent` dans Telegram avec le même assistant
+  (le fichier est envoyé à qBittorrent via multipart puis supprimé du dossier temporaire)
 - `/downloads [all|active|paused|completed]`
 - `/pause [id|nom]`, `/resume [id|nom]`, `/delete [id|nom]`
 - Sans argument sur `/pause`, `/resume`, `/delete`: affichage des torrents actionnables avec boutons Telegram
@@ -66,6 +68,7 @@ Variables qBittorrent recommandées:
 - `QBITTORRENT_HOST`, `QBITTORRENT_PORT`
 - `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD`
 - `MOVIES_PATH`, `SERIES_PATH`, `OTHER_PATH`
+- `MAX_TORRENT_FILE_SIZE_MB` (optionnel, 20 Mo par défaut)
 
 ---
 
