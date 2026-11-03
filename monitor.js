@@ -232,9 +232,11 @@ const state = {
   awaitingCustomPath: new Set(),
   awaitingCustomName: new Set(),
   awaitingMovieSearch: new Set(),
+  awaitingSeriesSearch: new Set(),
   awaitingQuickTorrent: new Map(),
   downloadsView: new Map(),
   movieCatalogView: new Map(),
+  seriesCatalogView: new Map(),
   notificationPreferences: new Map(),
   qbitSid: null,
   torrentAliasesByHash: new Map(),
@@ -1141,6 +1143,32 @@ async function buildMoviesCatalog(rootPath, options = {}) {
   return videos;
 }
 
+async function buildSeriesCatalog(rootPath) {
+  const episodes = await buildMoviesCatalog(rootPath, {
+    maxResults: 2000,
+    maxDepth: 6,
+  });
+  const seriesByKey = new Map();
+
+  for (const episode of episodes) {
+    const relativeDirectory = path.relative(rootPath, episode.directory);
+    const firstDirectory = relativeDirectory.split(path.sep)[0];
+    const episodeMatch = episode.simpleName.match(
+      /^(.+?)\s+(?:S\d{1,2}(?:E\d{1,2})?|Saison\s+\d+)/i,
+    );
+    const key = firstDirectory || episodeMatch?.[1] || episode.simpleName;
+    const current = seriesByKey.get(key);
+    if (!current || episode.updatedAt > current.updatedAt) {
+      seriesByKey.set(key, {
+        ...episode,
+        simpleName: simplifyTorrentName(firstDirectory || episodeMatch?.[1] || episode.simpleName),
+      });
+    }
+  }
+
+  return [...seriesByKey.values()];
+}
+
 async function renderMovieCatalog(chatId, options = {}) {
   const previous = state.movieCatalogView.get(chatId) || {};
   const sort = options.sort || previous.sort || "az";
@@ -1171,13 +1199,14 @@ async function renderMovieCatalog(chatId, options = {}) {
   state.movieCatalogView.set(chatId, { sort, query, page: safePage });
 
   const title = query ? `🔎 Films : « ${query} »` : "🎬 Bibliothèque de films";
+  const itemLines = items.map(
+    (movie, index) => `${safePage * pageSize + index + 1}. ${movie.simpleName}`,
+  );
   const lines = [
     `*${title}*`,
     `${filtered.length} résultat(s) · page ${safePage + 1}/${totalPages}`,
     "",
-    ...(items.length
-      ? items.map((movie, index) => `${safePage * pageSize + index + 1}. ${movie.simpleName}`)
-      : ["Aucun film trouvé."]),
+    ...(itemLines.length ? itemLines : ["Aucun film trouvé."]),
   ];
   const keyboard = [
     [
@@ -1207,17 +1236,23 @@ async function renderMovieCatalog(chatId, options = {}) {
     reply_markup: { inline_keyboard: keyboard },
   };
   if (options.editMeta) {
-    await bot.editMessageText(lines.join("\n"), {
+    await bot.editMessageText(lines.join("\n\n"), {
       chat_id: options.editMeta.chatId,
       message_id: options.editMeta.messageId,
       ...messageOptions,
     });
   } else {
-    await safeSendMessage(chatId, lines.join("\n"), messageOptions);
+    await safeSendMessage(chatId, lines.join("\n\n"), messageOptions);
   }
 }
 
-async function renderMovieDetails(chatId, movie, editMeta = null) {
+async function renderMovieDetails(
+  chatId,
+  movie,
+  editMeta = null,
+  mediaLabel = "Film",
+  mediaIcon = "🎬",
+) {
   const extension = path.extname(movie.fileName);
   const fullPath = path.join(movie.directory, movie.fileName);
   let size = "inconnue";
@@ -1226,8 +1261,82 @@ async function renderMovieDetails(chatId, movie, editMeta = null) {
   } catch (error) {
     logInfo(`⚠️ Taille du film indisponible: ${error.message}`);
   }
+
+  async function renderSeriesCatalog(chatId, options = {}) {
+    const previous = state.seriesCatalogView.get(chatId) || {};
+    const sort = options.sort || previous.sort || "az";
+    const query = (options.query ?? previous.query ?? "").trim();
+    const page = options.page ?? previous.page ?? 0;
+    const series = await buildSeriesCatalog(CONFIG.qbit.pathSeries);
+    const filtered = query
+      ? series.filter((item) =>
+          item.simpleName.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")),
+        )
+      : series;
+
+    if (sort === "recent") {
+      filtered.sort((a, b) => b.updatedAt - a.updatedAt);
+    } else if (sort === "za") {
+      filtered.sort((a, b) => b.simpleName.localeCompare(a.simpleName, "fr"));
+    } else {
+      filtered.sort((a, b) => a.simpleName.localeCompare(b.simpleName, "fr"));
+    }
+
+    const pageSize = 8;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const items = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+    state.seriesCatalogView.set(chatId, { sort, query, page: safePage });
+
+    const title = query ? `🔎 Séries : « ${query} »` : "📺 Bibliothèque de séries";
+    const itemLines = items.map(
+      (item, index) => `${safePage * pageSize + index + 1}. ${item.simpleName}`,
+    );
+    const lines = [
+      `*${title}*`,
+      `${filtered.length} résultat(s) · page ${safePage + 1}/${totalPages}`,
+      "",
+      ...(itemLines.length ? itemLines : ["Aucune série trouvée."]),
+    ];
+    const keyboard = [
+      [
+        { text: "🔤 A-Z", callback_data: "sc:sort:az" },
+        { text: "🔤 Z-A", callback_data: "sc:sort:za" },
+        { text: "🕘 Récentes", callback_data: "sc:sort:recent" },
+      ],
+      [
+        { text: "🔎 Rechercher", callback_data: "sc:search" },
+        { text: "🔄 Actualiser", callback_data: "sc:refresh" },
+      ],
+      [
+        { text: "⬅️", callback_data: "sc:page:prev" },
+        { text: `Page ${safePage + 1}/${totalPages}`, callback_data: "sc:noop" },
+        { text: "➡️", callback_data: "sc:page:next" },
+      ],
+      ...items.map((item, index) => [
+        {
+          text: `📺 ${item.simpleName.slice(0, 38)}`,
+          callback_data: `sc:item:${safePage * pageSize + index}`,
+        },
+      ]),
+      [{ text: "🏠 Menu", callback_data: "menu:home" }],
+    ];
+    const message = {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: keyboard },
+    };
+    if (options.editMeta) {
+      await bot.editMessageText(lines.join("\n\n"), {
+        chat_id: options.editMeta.chatId,
+        message_id: options.editMeta.messageId,
+        ...message,
+      });
+    } else {
+      await safeSendMessage(chatId, lines.join("\n\n"), message);
+    }
+  }
   const text = [
-    `🎬 *${movie.simpleName}*`,
+    `${mediaIcon} *${movie.simpleName}*`,
     "",
     `📁 Fichier: \`${movie.fileName}\``,
     `💾 Taille: ${size}`,
@@ -1239,7 +1348,10 @@ async function renderMovieDetails(chatId, movie, editMeta = null) {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "⬅️ Retour aux films", callback_data: "mc:back" },
+          {
+            text: `⬅️ Retour aux ${mediaLabel.toLowerCase()}s`,
+            callback_data: mediaLabel === "Série" ? "sc:back" : "mc:back",
+          },
           { text: "🏠 Menu", callback_data: "menu:home" },
         ],
       ],
@@ -1693,7 +1805,7 @@ async function renderNotificationSettings(chatId, editMeta = null) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Commandes Telegram
 // ─────────────────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/^\/start(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     await safeSendMessage(
@@ -1712,6 +1824,7 @@ bot.onText(/\/start/, async (msg) => {
               { text: "🎬 Films", callback_data: "menu:movies" },
             ],
             [
+              { text: "📺 Séries", callback_data: "menu:series-library" },
               { text: "💾 Espace disque", callback_data: "menu:disk" },
               { text: "📊 Tableau de bord", callback_data: "menu:dashboard" },
             ],
@@ -1726,7 +1839,7 @@ bot.onText(/\/start/, async (msg) => {
   });
 });
 
-bot.onText(/\/cancel/i, async (msg) => {
+bot.onText(/^\/cancel(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const upload = state.torrentUploads.get(chatId);
@@ -1741,45 +1854,51 @@ bot.onText(/\/cancel/i, async (msg) => {
     state.awaitingCustomPath.delete(chatId);
     state.awaitingCustomName.delete(chatId);
     state.awaitingMovieSearch.delete(chatId);
+    state.awaitingSeriesSearch.delete(chatId);
     await safeSendMessage(chatId, "❌ Annulé.");
-  });
-
-  bot.onText(/\/film(?:\s+(.+))?/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    await withAuthorizedChat(chatId, async () => {
-      const source = (match?.[1] || "").trim();
-      if (!source) {
-        state.awaitingQuickTorrent.set(chatId, "movie");
-        await safeSendMessage(chatId, "🎬 Envoie maintenant le lien magnet ou l’URL du torrent.", {
-          reply_markup: { force_reply: true },
-        });
-        return;
-      }
-      initializeTorrentSession(chatId, source, "movie");
-      await askConfirmation(chatId, state.torrentSessions.get(chatId));
-    });
-  });
-
-  bot.onText(/\/status/i, async (msg) => {
-    const chatId = msg.chat.id;
-    await withAuthorizedChat(chatId, async () => {
-      try {
-        await renderDashboard(chatId);
-      } catch (error) {
-        await safeSendMessage(chatId, `❌ Tableau de bord indisponible: ${error.message}`);
-      }
-    });
-  });
-
-  bot.onText(/\/notifications/i, async (msg) => {
-    const chatId = msg.chat.id;
-    await withAuthorizedChat(chatId, async () => {
-      await renderNotificationSettings(chatId);
-    });
   });
 });
 
-bot.onText(/\/help/, async (msg) => {
+bot.onText(/^\/film(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  await withAuthorizedChat(chatId, async () => {
+    const source = (match?.[1] || "").trim();
+    if (!source) {
+      state.awaitingQuickTorrent.set(chatId, "movie");
+      await safeSendMessage(
+        chatId,
+        "🎬 Envoie maintenant le lien magnet ou l’URL du torrent.",
+        { reply_markup: { force_reply: true } },
+      );
+      return;
+    }
+    initializeTorrentSession(chatId, source, "movie");
+    await askConfirmation(chatId, state.torrentSessions.get(chatId));
+  });
+});
+
+bot.onText(/^\/status(?:@\w+)?$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  await withAuthorizedChat(chatId, async () => {
+    try {
+      await renderDashboard(chatId);
+    } catch (error) {
+      await safeSendMessage(
+        chatId,
+        `❌ Tableau de bord indisponible: ${error.message}`,
+      );
+    }
+  });
+});
+
+bot.onText(/^\/notifications(?:@\w+)?$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  await withAuthorizedChat(chatId, async () => {
+    await renderNotificationSettings(chatId);
+  });
+});
+
+bot.onText(/^\/help(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const text = [
@@ -1796,6 +1915,8 @@ bot.onText(/\/help/, async (msg) => {
       "- /downloads [all|active|paused|completed]",
       "- /movies [az|za|recent] (catalogue interactif)",
       "- /search <titre> (chercher un film)",
+      "- /serieslist [az|za|recent] (catalogue interactif)",
+      "- /searchseries <titre> (chercher une série)",
       "- /film [magnet|url] (assistant rapide)",
       "- /status (tableau de bord)",
       "- /notifications (préférences d'alertes)",
@@ -1807,6 +1928,7 @@ bot.onText(/\/help/, async (msg) => {
       "🎬 Médias",
       "- /random",
       "- /movies [az|za|recent]",
+      "- /serieslist [az|za|recent]",
       "",
       "💡 Le mode BACKUP n'écoute Telegram que pendant une panne Ubuntu.",
     ].join("\n");
@@ -1814,7 +1936,7 @@ bot.onText(/\/help/, async (msg) => {
   });
 });
 
-bot.onText(/\/check/, async (msg) => {
+bot.onText(/^\/check(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     try {
@@ -1852,7 +1974,7 @@ bot.onText(/\/check/, async (msg) => {
   });
 });
 
-bot.onText(/\/restart_plex/, async (msg) => {
+bot.onText(/^\/restart_plex(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     if (CONFIG.isContainer) {
@@ -1902,7 +2024,7 @@ bot.onText(/\/restart_plex/, async (msg) => {
   });
 });
 
-bot.onText(/\/torrent(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/torrent(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const source = (match?.[1] || "").trim();
@@ -1917,7 +2039,7 @@ bot.onText(/\/torrent(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/movie(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const source = (match?.[1] || "").trim();
@@ -1930,7 +2052,7 @@ bot.onText(/\/movie(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/series(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const source = (match?.[1] || "").trim();
@@ -1943,7 +2065,7 @@ bot.onText(/\/series(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/downloads?(?:\s+(\S+))?/i, async (msg, match) => {
+bot.onText(/^\/downloads?(?:@\w+)?(?:\s+(\S+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const filter = parseFilterArg(match?.[1]);
@@ -1959,7 +2081,7 @@ bot.onText(/\/downloads?(?:\s+(\S+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/pause(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/pause(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const name = (match?.[1] || "").trim();
@@ -1981,7 +2103,7 @@ bot.onText(/\/pause(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/resume(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/resume(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const name = (match?.[1] || "").trim();
@@ -2003,7 +2125,7 @@ bot.onText(/\/resume(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/delete(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/delete(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     const name = (match?.[1] || "").trim();
@@ -2025,7 +2147,7 @@ bot.onText(/\/delete(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/random/i, async (msg) => {
+bot.onText(/^\/random(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     try {
@@ -2052,8 +2174,10 @@ bot.onText(/\/random/i, async (msg) => {
   });
 });
 
-bot.onText(/\/movies(?:\s+(\S+))?/i, async (msg, match) => {
+bot.onText(/^\/movies(?:@\w+)?(?:\s+(\S+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
+  state.awaitingMovieSearch.delete(chatId);
+  state.awaitingSeriesSearch.delete(chatId);
   await withAuthorizedChat(chatId, async () => {
     const mode = (match?.[1] || "az").toLowerCase();
     try {
@@ -2066,8 +2190,9 @@ bot.onText(/\/movies(?:\s+(\S+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/search(?:\s+(.+))?/i, async (msg, match) => {
+bot.onText(/^\/search(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
+  state.awaitingSeriesSearch.delete(chatId);
   await withAuthorizedChat(chatId, async () => {
     const query = (match?.[1] || "").trim();
     if (!query) {
@@ -2075,6 +2200,7 @@ bot.onText(/\/search(?:\s+(.+))?/i, async (msg, match) => {
     await safeSendMessage(chatId, "🔎 Quel film cherches-tu ?", {
       reply_markup: { force_reply: true },
     });
+
     return;
     }
     try {
@@ -2085,7 +2211,43 @@ bot.onText(/\/search(?:\s+(.+))?/i, async (msg, match) => {
   });
 });
 
-bot.onText(/\/(?:disk|space|storage)(?:@\w+)?$/i, async (msg) => {
+bot.onText(/^\/serieslist(?:@\w+)?(?:\s+(\S+))?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  state.awaitingMovieSearch.delete(chatId);
+  state.awaitingSeriesSearch.delete(chatId);
+  await withAuthorizedChat(chatId, async () => {
+    const mode = (match?.[1] || "az").toLowerCase();
+    try {
+      await renderSeriesCatalog(chatId, {
+        sort: ["az", "za", "recent"].includes(mode) ? mode : "az",
+      });
+    } catch (error) {
+      await safeSendMessage(chatId, `❌ /serieslist: ${error.message}`);
+    }
+  });
+});
+
+bot.onText(/^\/searchseries(?:@\w+)?(?:\s+(.+))?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  state.awaitingMovieSearch.delete(chatId);
+  await withAuthorizedChat(chatId, async () => {
+    const query = (match?.[1] || "").trim();
+    if (!query) {
+      state.awaitingSeriesSearch.add(chatId);
+      await safeSendMessage(chatId, "🔎 Quelle série cherches-tu ?", {
+        reply_markup: { force_reply: true },
+      });
+      return;
+    }
+    try {
+      await renderSeriesCatalog(chatId, { query, page: 0 });
+    } catch (error) {
+      await safeSendMessage(chatId, `❌ /searchseries: ${error.message}`);
+    }
+  });
+});
+
+bot.onText(/^\/(?:disk|space|storage)(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     try {
@@ -2100,7 +2262,7 @@ bot.onText(/\/(?:disk|space|storage)(?:@\w+)?$/i, async (msg) => {
   });
 });
 
-bot.onText(/\/export_torrents/i, async (msg) => {
+bot.onText(/^\/export_torrents(?:@\w+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   await withAuthorizedChat(chatId, async () => {
     try {
@@ -2257,6 +2419,16 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  if (state.awaitingSeriesSearch.has(chatId)) {
+    state.awaitingSeriesSearch.delete(chatId);
+    try {
+      await renderSeriesCatalog(chatId, { query: msg.text, page: 0 });
+    } catch (error) {
+      await safeSendMessage(chatId, `❌ Recherche impossible: ${error.message}`);
+    }
+    return;
+  }
+
   if (state.awaitingCustomName.has(chatId)) {
     const session = state.torrentSessions.get(chatId);
     if (!session) {
@@ -2320,6 +2492,8 @@ bot.on("callback_query", async (query) => {
     if (data === "menu:movie" || data === "menu:series") {
       const mediaType = data.endsWith("movie") ? "movie" : "series";
       const label = mediaType === "movie" ? "🎬 film" : "📺 série";
+      state.awaitingMovieSearch.delete(chatId);
+      state.awaitingSeriesSearch.delete(chatId);
       state.awaitingQuickTorrent.set(chatId, mediaType);
       await safeSendMessage(
         chatId,
@@ -2334,6 +2508,10 @@ bot.on("callback_query", async (query) => {
     }
     if (data === "menu:movies") {
       await renderMovieCatalog(chatId);
+      return;
+    }
+    if (data === "menu:series-library") {
+      await renderSeriesCatalog(chatId);
       return;
     }
     if (data === "menu:disk") {
@@ -2351,6 +2529,7 @@ bot.on("callback_query", async (query) => {
     if (data === "menu:home") {
       state.awaitingQuickTorrent.delete(chatId);
       state.awaitingMovieSearch.delete(chatId);
+      state.awaitingSeriesSearch.delete(chatId);
       await safeSendMessage(chatId, "🏠 Menu principal :", {
         reply_markup: {
           inline_keyboard: [
@@ -2363,6 +2542,7 @@ bot.on("callback_query", async (query) => {
               { text: "🎬 Films", callback_data: "menu:movies" },
             ],
             [
+              { text: "📺 Séries", callback_data: "menu:series-library" },
               { text: "💾 Espace disque", callback_data: "menu:disk" },
               { text: "📊 Tableau de bord", callback_data: "menu:dashboard" },
             ],
@@ -2622,6 +2802,7 @@ bot.on("callback_query", async (query) => {
         await renderMovieCatalog(chatId, { editMeta: { chatId, messageId } });
         return;
       }
+
       if (data.startsWith("mc:item:")) {
         const index = Number.parseInt(data.split(":")[2], 10);
         const catalog = await buildMoviesCatalog(CONFIG.qbit.pathMovie, {
@@ -2675,6 +2856,82 @@ bot.on("callback_query", async (query) => {
           page: view.page + (data.endsWith("next") ? 1 : -1),
           editMeta: { chatId, messageId },
         });
+        return;
+      }
+    }
+
+    if (data.startsWith("sc:")) {
+      const view = state.seriesCatalogView.get(chatId) || {
+        sort: "az",
+        query: "",
+        page: 0,
+      };
+      if (data === "sc:noop") return;
+      if (data === "sc:back") {
+        await renderSeriesCatalog(chatId, {
+          ...view,
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data === "sc:search") {
+        state.awaitingSeriesSearch.add(chatId);
+        await safeSendMessage(chatId, "🔎 Quelle série cherches-tu ?", {
+          reply_markup: { force_reply: true },
+        });
+        return;
+      }
+      if (data === "sc:refresh") {
+        await renderSeriesCatalog(chatId, {
+          ...view,
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data.startsWith("sc:sort:")) {
+        await renderSeriesCatalog(chatId, {
+          ...view,
+          sort: data.split(":")[2],
+          page: 0,
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data === "sc:page:next" || data === "sc:page:prev") {
+        await renderSeriesCatalog(chatId, {
+          ...view,
+          page: view.page + (data.endsWith("next") ? 1 : -1),
+          editMeta: { chatId, messageId },
+        });
+        return;
+      }
+      if (data.startsWith("sc:item:")) {
+        const index = Number.parseInt(data.split(":")[2], 10);
+        const catalog = await buildSeriesCatalog(CONFIG.qbit.pathSeries);
+        const sorted = catalog
+          .filter((item) =>
+            view.query
+              ? item.simpleName
+                  .toLocaleLowerCase("fr")
+                  .includes(view.query.toLocaleLowerCase("fr"))
+              : true,
+          )
+          .sort((a, b) =>
+            view.sort === "recent"
+              ? b.updatedAt - a.updatedAt
+              : view.sort === "za"
+                ? b.simpleName.localeCompare(a.simpleName, "fr")
+                : a.simpleName.localeCompare(b.simpleName, "fr"),
+          );
+        if (sorted[index]) {
+          await renderMovieDetails(
+            chatId,
+            sorted[index],
+            { chatId, messageId },
+            "Série",
+            "📺",
+          );
+        }
         return;
       }
     }
@@ -2807,6 +3064,8 @@ _Nom d'origine: ${oldName}_`,
       { command: "downloads", description: "Voir les téléchargements" },
       { command: "movies", description: "Parcourir la bibliothèque de films" },
       { command: "search", description: "Rechercher un film" },
+      { command: "serieslist", description: "Parcourir la bibliothèque de séries" },
+      { command: "searchseries", description: "Rechercher une série" },
       { command: "status", description: "Tableau de bord serveur" },
       { command: "notifications", description: "Gérer les notifications" },
       { command: "disk", description: "Voir l'espace disque disponible" },

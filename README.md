@@ -44,6 +44,9 @@ Surveillance hybride haute disponibilité pour Plex Media Server avec Telegram e
   A-Z, Z-A ou par date récente
 - `/search <titre>` recherche un film dans `MOVIES_PATH`; le bouton de recherche
   du catalogue permet aussi une recherche guidée directement dans Telegram
+- `/serieslist [az|za|recent]` ouvre le catalogue des séries, regroupées par
+  série plutôt que par épisode
+- `/searchseries <titre>` recherche une série dans `SERIES_PATH`
 - Les boutons du catalogue ouvrent une fiche détaillée avec fichier, taille,
   date de modification et format.
 - `/film [magnet|url]` propose un assistant rapide avec le dossier Films et
